@@ -24,12 +24,10 @@ private extension Array {
     }
 }
 
-/// Native Swift implementation of `Backend`, backed by `PhotoStore` (GRDB).
-/// Mirrors `python/ml/scanner.py`'s ingest, hashing-pipeline, and status
-/// bookkeeping. Hashing uses `PHash` (native `imagehash.phash` port, with
-/// AVFoundation replacing ffmpeg for video frames); clustering uses
-/// `Clusterer` (port of all five cluster kinds).
-actor LocalBackend: Backend {
+/// Native scan/hash/cluster engine, backed by `PhotoStore` (GRDB). Ingests
+/// metadata from `PhotoLibraryBridge`, hashes via `PHash`, and clusters via
+/// `Clusterer` (all five cluster kinds).
+actor LocalBackend {
     static let shared = LocalBackend()
 
     private struct ScanState {

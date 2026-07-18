@@ -1,10 +1,4 @@
 .DS_Store
-__pycache__/
-*.pyc
-.venv/
-photos.db
-photos.db-shm
-photos.db-wal
 xcuserdata/
 DerivedData/
 *.xcuserstate

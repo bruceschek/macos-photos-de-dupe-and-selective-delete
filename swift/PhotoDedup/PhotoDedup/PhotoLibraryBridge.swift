@@ -79,7 +79,7 @@ final class PhotoLibraryBridge {
         try await ingestFetchResult(
             videoResult, libraryURL: libraryURL, total: total, offset: imageResult.count, trackCloud: false)
 
-        // Phase 2: download 512×512 previews for iCloud-only images so Python can hash them
+        // Phase 2: download 512×512 previews for iCloud-only images so LocalBackend can hash them
         //          Videos are intentionally excluded — no downloads triggered for video
         if !cloudImageAssets.isEmpty {
             print("[Bridge] \(cloudImageAssets.count) iCloud images need thumbnail download")
@@ -95,14 +95,14 @@ final class PhotoLibraryBridge {
                 }
 
                 if FileManager.default.fileExists(atPath: cachePath) {
-                    try? await CurrentBackend.shared.updateFilePath(uuid: uuid, path: cachePath)
+                    try? await LocalBackend.shared.updateFilePath(uuid: uuid, path: cachePath)
                 }
             }
             phase = .downloading(current: cloudImageAssets.count, total: cloudImageAssets.count)
         }
 
-        print("[Bridge] All ingestion done. Starting Python hashing.")
-        try await CurrentBackend.shared.startHashing()
+        print("[Bridge] All ingestion done. Starting hashing.")
+        try await LocalBackend.shared.startHashing()
         phase = .done
     }
 
@@ -138,7 +138,7 @@ final class PhotoLibraryBridge {
                 }
             }
 
-            try await CurrentBackend.shared.ingestBatch(records)
+            try await LocalBackend.shared.ingestBatch(records)
             cursor = end
             phase = .ingesting(current: offset + cursor, total: total)
         }

@@ -101,15 +101,15 @@ struct ClusterListView: View {
     private func refreshOnce() async -> Bool {
         print("[ClusterListView] refresh() called")
         do {
-            status = try await CurrentBackend.shared.status()
+            status = try await LocalBackend.shared.status()
             print("[ClusterListView] status: state=\(status?.state ?? "nil"), total=\(status?.totalPhotos ?? 0), scanned=\(status?.scanned ?? 0)")
-            if let err = status?.error { print("[ClusterListView] scan error from Python: \(err)") }
+            if let err = status?.error { print("[ClusterListView] scan error: \(err)") }
 
             if status?.state == "done" {
-                clusters = try await CurrentBackend.shared.clusters()
+                clusters = try await LocalBackend.shared.clusters()
                 print("[ClusterListView] loaded \(clusters.count) clusters")
             } else if status?.state == "error" {
-                clusters = try await CurrentBackend.shared.clusters()
+                clusters = try await LocalBackend.shared.clusters()
                 print("[ClusterListView] loaded \(clusters.count) clusters (partial, scan errored)")
             } else if status?.state == "running" {
                 return true
@@ -125,7 +125,7 @@ struct ClusterListView: View {
     private func startScan() async {
         print("[ClusterListView] startScan() — using PhotoLibraryBridge")
         do {
-            try await CurrentBackend.shared.beginScan()
+            try await LocalBackend.shared.beginScan()
             clusters = []
             selectedCluster = nil
 

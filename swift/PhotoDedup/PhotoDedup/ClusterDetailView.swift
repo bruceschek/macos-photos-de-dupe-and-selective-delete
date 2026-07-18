@@ -111,7 +111,7 @@ struct ClusterDetailView: View {
         detail = nil
         selectedUUIDs = []
         do {
-            let loaded = try await CurrentBackend.shared.cluster(id: clusterId)
+            let loaded = try await LocalBackend.shared.cluster(id: clusterId)
             detail = loaded
             isLoading = false
         } catch is CancellationError {
