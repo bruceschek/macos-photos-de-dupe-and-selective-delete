@@ -36,6 +36,17 @@ struct ClusterListView: View {
             if clusters.isEmpty && status?.state == "done" {
                 ContentUnavailableView("No Duplicates Found", systemImage: "checkmark.circle",
                     description: Text("Your library is clean, or a scan hasn't run yet."))
+            } else if let s = status, clusters.isEmpty, s.state != "running" {
+                // Fresh database (first run of the native backend) — nothing
+                // to show until a scan populates it.
+                ContentUnavailableView {
+                    Label("No Scan Yet", systemImage: "photo.stack")
+                } description: {
+                    Text("Scan your library to find duplicate photos and videos.")
+                } actions: {
+                    Button("Scan Library") { Task { await startScan() } }
+                        .buttonStyle(.borderedProminent)
+                }
             } else {
                 List(clusters, selection: $selectedCluster) { cluster in
                     ClusterRow(cluster: cluster).tag(cluster)
