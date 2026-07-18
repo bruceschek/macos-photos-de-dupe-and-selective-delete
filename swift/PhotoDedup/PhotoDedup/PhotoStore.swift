@@ -145,6 +145,11 @@ actor PhotoStore {
                 );
                 """)
         }
+        migrator.registerMigration("v2") { db in
+            // Alternate hashes per photo: 8 dihedral orientations for images,
+            // sampled frame hashes for videos. Comma-joined hex, primary first.
+            try db.execute(sql: "ALTER TABLE photos ADD COLUMN phash_variants TEXT")
+        }
         try! migrator.migrate(dbQueue)
     }
 

@@ -111,33 +111,41 @@ enum Clusterer {
 
     private static func clusterPhash(_ db: Database, now: Double) throws {
         let rows = try Row.fetchAll(db, sql:
-            "SELECT uuid, phash FROM photos WHERE phash IS NOT NULL")
+            "SELECT uuid, phash, phash_variants FROM photos WHERE phash IS NOT NULL")
 
-        var hashes: [(uuid: String, value: UInt64)] = []
+        var entries: [(uuid: String, primary: UInt64, variants: [UInt64])] = []
         for row in rows {
             let hex: String = row["phash"]
-            guard let value = UInt64(hex, radix: 16) else { continue }
+            guard let primary = UInt64(hex, radix: 16) else { continue }
             // Near-uniform frames (all-black clips, blank scans) produce
             // degenerate hashes that would glue everything together.
-            let bitCount = value.nonzeroBitCount
+            let bitCount = primary.nonzeroBitCount
             if bitCount <= phashMinBits || bitCount >= phashMaxBits { continue }
-            hashes.append((row["uuid"], value))
+            let variants = parseVariants(row["phash_variants"], fallback: primary)
+            entries.append((row["uuid"], primary, variants))
         }
-        guard !hashes.isEmpty else { return }
+        guard !entries.isEmpty else { return }
 
+        // Tree holds primary hashes; each photo queries with all its variants
+        // (orientations for images, sampled frames for videos), so a rotated
+        // or mirrored duplicate still lands within the Hamming threshold.
         var unionFind = UnionFind()
         let tree = BKTree()
-        for (uuid, value) in hashes {
-            unionFind.add(uuid)
-            for neighbor in tree.find(value, within: phashThreshold) {
-                unionFind.union(uuid, neighbor)
+        for entry in entries {
+            unionFind.add(entry.uuid)
+            tree.add(entry.primary, uuid: entry.uuid)
+        }
+        for entry in entries {
+            for variant in entry.variants {
+                for neighbor in tree.find(variant, within: phashThreshold) {
+                    unionFind.union(entry.uuid, neighbor)
+                }
             }
-            tree.add(value, uuid: uuid)
         }
 
         var groups: [String: [String]] = [:]
-        for (uuid, _) in hashes {
-            groups[unionFind.find(uuid), default: []].append(uuid)
+        for entry in entries {
+            groups[unionFind.find(entry.uuid), default: []].append(entry.uuid)
         }
         let confidence = max(0.0, 1.0 - Double(phashThreshold) / 64.0)
         for group in groups.values where group.count > 1 {
@@ -145,11 +153,16 @@ enum Clusterer {
         }
     }
 
+    private static func parseVariants(_ joined: String?, fallback: UInt64) -> [UInt64] {
+        let parsed = joined?.split(separator: ",").compactMap { UInt64($0, radix: 16) } ?? []
+        return parsed.isEmpty ? [fallback] : parsed
+    }
+
     private struct VideoEntry {
         let uuid: String
         let duration: Double
         let dateTaken: Double
-        let phash: String?
+        let frameHashes: [UInt64]   // sampled frames (or poster); empty = no visual data
         let width: Int
         let height: Int
     }
@@ -158,7 +171,7 @@ enum Clusterer {
     /// duration proximity + aspect-ratio sanity → frame-pHash visual veto.
     private static func clusterVideos(_ db: Database, now: Double) throws {
         let rows = try Row.fetchAll(db, sql: """
-            SELECT uuid, original_filename, duration, date_taken, phash, width, height
+            SELECT uuid, original_filename, duration, date_taken, phash, phash_variants, width, height
             FROM photos WHERE media_type = 'video'
             """)
 
@@ -167,11 +180,18 @@ enum Clusterer {
             guard let filename: String = row["original_filename"] else { continue }
             let stem = (filename as NSString).deletingPathExtension.lowercased()
             guard !stem.isEmpty else { continue }
+            let primaryHex: String? = row["phash"]
+            let frameHashes: [UInt64]
+            if let primary = primaryHex.flatMap({ UInt64($0, radix: 16) }) {
+                frameHashes = parseVariants(row["phash_variants"], fallback: primary)
+            } else {
+                frameHashes = []
+            }
             stems[stem, default: []].append(VideoEntry(
                 uuid: row["uuid"],
                 duration: row["duration"] ?? 0,
                 dateTaken: row["date_taken"] ?? 0,
-                phash: row["phash"],
+                frameHashes: frameHashes,
                 width: row["width"] ?? 0,
                 height: row["height"] ?? 0))
         }
@@ -207,11 +227,11 @@ enum Clusterer {
                         }
                     }
 
-                    // Frame-pHash veto: when EVERY member has a hash, all pairs
-                    // must be visually similar; one mismatch disqualifies.
-                    let parsed = group.compactMap { $0.phash.flatMap { UInt64($0, radix: 16) } }
-                    if parsed.count == group.count,
-                       !allPairsWithin(parsed, threshold: videoPhashThreshold) {
+                    // Frame-pHash veto: when EVERY member has visual data, all
+                    // pairs must be similar in at least one frame combination;
+                    // one fully-mismatched pair disqualifies the group.
+                    if group.allSatisfy({ !$0.frameHashes.isEmpty }),
+                       !allPairsMinWithin(group.map(\.frameHashes), threshold: videoPhashThreshold) {
                         continue
                     }
 
@@ -254,10 +274,18 @@ enum Clusterer {
         return groups
     }
 
-    private static func allPairsWithin(_ values: [UInt64], threshold: Int) -> Bool {
-        for i in values.indices {
-            for j in values.indices where j > i {
-                if PHash.hammingDistance(values[i], values[j]) > threshold { return false }
+    /// True iff every pair of videos has at least one frame combination
+    /// within the Hamming threshold (min cross-distance per pair).
+    private static func allPairsMinWithin(_ hashLists: [[UInt64]], threshold: Int) -> Bool {
+        for i in hashLists.indices {
+            for j in hashLists.indices where j > i {
+                var minDistance = Int.max
+                for a in hashLists[i] {
+                    for b in hashLists[j] {
+                        minDistance = min(minDistance, PHash.hammingDistance(a, b))
+                    }
+                }
+                if minDistance > threshold { return false }
             }
         }
         return true

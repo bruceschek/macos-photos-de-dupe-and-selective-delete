@@ -197,14 +197,10 @@ struct ScanStatusBanner: View {
             Circle().fill(stateColor).frame(width: 8, height: 8)
             VStack(alignment: .leading, spacing: 2) {
                 Text(bannerTitle).font(AppFont.base.bold())
-                if case .downloading(let cur, let tot) = bridge.phase, tot > 0 {
-                    ProgressView(value: Double(cur), total: Double(tot)).progressViewStyle(.linear)
-                    Text("Downloading iCloud previews: \(cur) / \(tot)")
-                        .font(AppFont.small).foregroundStyle(.secondary)
-                } else if status.totalPhotos > 0 && status.state == "running" {
+                if status.totalPhotos > 0 && status.state == "running" {
                     ProgressView(value: Double(status.scanned), total: Double(status.totalPhotos))
                         .progressViewStyle(.linear)
-                    Text("\(status.scanned) / \(status.totalPhotos) · \(status.skippedCloud) cloud-only skipped")
+                    Text("\(status.scanned) / \(status.totalPhotos) · \(status.skippedCloud) skipped")
                         .font(AppFont.small).foregroundStyle(.secondary)
                     if let eta = displayedETA {
                         Text("ETA: \(eta)")
@@ -232,8 +228,7 @@ struct ScanStatusBanner: View {
     }
 
     private var bannerTitle: String {
-        if case .downloading = bridge.phase { return "Downloading iCloud Previews" }
-        if case .ingesting = bridge.phase   { return "Ingesting" }
+        if case .ingesting = bridge.phase { return "Ingesting" }
         return status.state.capitalized
     }
 

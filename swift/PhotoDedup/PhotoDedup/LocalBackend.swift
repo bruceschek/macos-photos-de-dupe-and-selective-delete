@@ -1,5 +1,6 @@
 import Foundation
 import GRDB
+import os
 
 enum LocalBackendError: Error, LocalizedError {
     case clusterNotFound(Int)
@@ -13,15 +14,7 @@ enum LocalBackendError: Error, LocalizedError {
 
 private struct HashCandidate: Sendable {
     let uuid: String
-    let path: String
-}
-
-private extension Array {
-    func chunked(into size: Int) -> [[Element]] {
-        stride(from: 0, to: count, by: size).map {
-            Array(self[$0..<Swift.min($0 + size, count)])
-        }
-    }
+    let localIdentifier: String
 }
 
 /// Native scan/hash/cluster engine, backed by `PhotoStore` (GRDB). Ingests
@@ -44,6 +37,16 @@ actor LocalBackend {
     private var state = ScanState()
     private var pipelineTask: Task<Void, Never>?
     private var pipelineGeneration = 0
+
+    // Streaming-pipeline coordination (all actor-isolated)
+    private var candidateCursor = 0
+    private var candidateTotal = 0
+    private var pendingHashWrites: [(uuid: String, primary: String, variants: String)] = []
+    private var pipelineFailure: Error?
+
+    private static let writeBatchSize = 200
+    private let signposter = OSSignposter(
+        subsystem: "com.bruceschechter.PhotoDedup", category: "Scan")
 
     func beginScan() async throws {
         pipelineGeneration += 1
@@ -81,14 +84,6 @@ actor LocalBackend {
         state.totalPhotos = ingested
     }
 
-    func updateFilePath(uuid: String, path: String) async throws {
-        try await store.write { db in
-            try db.execute(
-                sql: "UPDATE photos SET file_path=?, is_local=1 WHERE uuid=?",
-                arguments: [path, uuid])
-        }
-    }
-
     func startHashing() async throws {
         // Mirrors Python's non-blocking lock: a second call while the
         // pipeline runs is a no-op.
@@ -108,12 +103,18 @@ actor LocalBackend {
             if pipelineGeneration == generation { pipelineTask = nil }
         }
         do {
+            let hashInterval = signposter.beginInterval("hashing")
             try await hashPhotos(generation: generation)
+            signposter.endInterval("hashing", hashInterval)
+
             guard pipelineGeneration == generation else { return }
             state.state = "clustering"
+            let clusterInterval = signposter.beginInterval("clustering")
             let clusterCount = try await store.write { db in
                 try Clusterer.buildClusters(db)
             }
+            signposter.endInterval("clustering", clusterInterval)
+
             guard pipelineGeneration == generation else { return }
             state.state = "done"
             print("[LocalBackend] Scan complete — \(clusterCount) clusters")
@@ -127,83 +128,108 @@ actor LocalBackend {
         }
     }
 
+    /// Streaming pipeline: workers claim candidates one at a time from an
+    /// actor-guarded cursor (no chunk barriers — one slow HEIC or cloud fetch
+    /// never stalls finished workers), hash via PhotoKit-sourced thumbnails
+    /// (`AssetHasher`), and results flush to the store in batched
+    /// transactions of `writeBatchSize`.
     private func hashPhotos(generation: Int) async throws {
-        let (imageRows, videoRows, total, skipped) = try await store.read {
-            db -> ([HashCandidate], [HashCandidate], Int, Int) in
-            let images = try Row.fetchAll(db, sql: """
-                SELECT uuid, file_path FROM photos
-                WHERE file_path IS NOT NULL AND is_local = 1 AND media_type = 'image'
-                """).map { HashCandidate(uuid: $0["uuid"], path: $0["file_path"]) }
-            let videos = try Row.fetchAll(db, sql: """
-                SELECT uuid, file_path FROM photos
-                WHERE file_path IS NOT NULL AND is_local = 1 AND media_type = 'video'
-                """).map { HashCandidate(uuid: $0["uuid"], path: $0["file_path"]) }
+        let (candidates, total) = try await store.read { db -> ([HashCandidate], Int) in
+            let rows = try Row.fetchAll(db, sql:
+                "SELECT uuid, local_identifier FROM photos WHERE local_identifier IS NOT NULL"
+            ).map { HashCandidate(uuid: $0["uuid"], localIdentifier: $0["local_identifier"]) }
             let total = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM photos") ?? 0
-            let skipped = try Int.fetchOne(db, sql:
-                "SELECT COUNT(*) FROM photos WHERE is_local = 0 OR file_path IS NULL") ?? 0
-            return (images, videos, total, skipped)
+            return (rows, total)
         }
         guard pipelineGeneration == generation else { return }
         state.totalPhotos = total
-        state.skippedCloud = skipped
+        state.skippedCloud = 0
+        candidateCursor = 0
+        candidateTotal = candidates.count
+        pendingHashWrites = []
+        pipelineFailure = nil
 
-        var scanned = 0
-        for chunk in imageRows.chunked(into: 32) {
-            try Task.checkCancellation()
-            try await writeHashes(computedFor: chunk, video: false)
-            scanned += chunk.count
-            guard pipelineGeneration == generation else { return }
-            state.scanned = scanned
-        }
-        for chunk in videoRows.chunked(into: 8) {
-            try Task.checkCancellation()
-            try await writeHashes(computedFor: chunk, video: true)
-            scanned += chunk.count
-            guard pipelineGeneration == generation else { return }
-            state.scanned = scanned
-        }
-    }
+        let hasher = AssetHasher(
+            uuidToIdentifier: candidates.map { ($0.uuid, $0.localIdentifier) })
 
-    private func writeHashes(computedFor chunk: [HashCandidate], video: Bool) async throws {
-        let results = await Self.computeHashes(chunk, video: video)
-        guard !results.isEmpty else { return }
-        try await store.write { db in
-            for (uuid, hash) in results {
-                try db.execute(sql: "UPDATE photos SET phash=? WHERE uuid=?",
-                               arguments: [hash, uuid])
-            }
-        }
-    }
-
-    /// nonisolated so the task-group children run on the global concurrent
-    /// executor instead of serializing on this actor.
-    private nonisolated static func computeHashes(
-        _ chunk: [HashCandidate], video: Bool
-    ) async -> [(String, String)] {
-        await withTaskGroup(of: (String, String?).self) { group in
-            for candidate in chunk {
+        let workerCount = max(2, ProcessInfo.processInfo.activeProcessorCount)
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<workerCount {
                 group.addTask {
-                    if video {
-                        return (candidate.uuid, await PHash.hash(videoAt: candidate.path))
-                    }
-                    return (candidate.uuid, PHash.hash(imageAt: candidate.path))
+                    await self.runHashWorker(
+                        candidates: candidates, hasher: hasher, generation: generation)
                 }
             }
-            var results: [(String, String)] = []
-            for await (uuid, hash) in group {
-                if let hash { results.append((uuid, hash)) }
+        }
+
+        await flushHashWrites()
+        if let failure = pipelineFailure { throw failure }
+        try Task.checkCancellation()
+    }
+
+    /// nonisolated so hashing math runs on the global concurrent executor;
+    /// the actor is only touched for cursor claims and result recording.
+    private nonisolated func runHashWorker(
+        candidates: [HashCandidate], hasher: AssetHasher, generation: Int
+    ) async {
+        while !Task.isCancelled,
+              let index = await claimNextCandidateIndex(generation: generation) {
+            let result = await hasher.hash(uuid: candidates[index].uuid)
+            await record(result, generation: generation)
+        }
+    }
+
+    private func claimNextCandidateIndex(generation: Int) -> Int? {
+        guard pipelineGeneration == generation,
+              pipelineFailure == nil,
+              candidateCursor < candidateTotal
+        else { return nil }
+        defer { candidateCursor += 1 }
+        return candidateCursor
+    }
+
+    private func record(_ result: AssetHasher.HashResult, generation: Int) async {
+        guard pipelineGeneration == generation else { return }
+        state.scanned += 1
+        if let primary = result.primary {
+            pendingHashWrites.append(
+                (result.uuid, primary, result.variants.joined(separator: ",")))
+            if pendingHashWrites.count >= Self.writeBatchSize {
+                await flushHashWrites()
             }
-            return results
+        } else {
+            state.skippedCloud += 1   // couldn't produce a hash for this asset
+        }
+        if state.scanned % 500 == 0, let start = state.scanStartTime {
+            let elapsed = Date().timeIntervalSince1970 - start
+            let rate = elapsed > 0 ? Double(state.scanned) / elapsed : 0
+            print("[LocalBackend] Hashed \(state.scanned)/\(candidateTotal) — \(String(format: "%.1f", rate)) assets/s")
+            signposter.emitEvent("hash-progress")
+        }
+    }
+
+    private func flushHashWrites() async {
+        guard !pendingHashWrites.isEmpty else { return }
+        let batch = pendingHashWrites
+        pendingHashWrites = []
+        do {
+            try await store.write { db in
+                for item in batch {
+                    try db.execute(
+                        sql: "UPDATE photos SET phash=?, phash_variants=? WHERE uuid=?",
+                        arguments: [item.primary, item.variants, item.uuid])
+                }
+            }
+        } catch {
+            pipelineFailure = error
         }
     }
 
     func status() async throws -> ScanStatus {
-        let (photoCount, clusterCount, skippedCount) = try await store.read { db -> (Int, Int, Int) in
+        let (photoCount, clusterCount) = try await store.read { db -> (Int, Int) in
             let photoCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM photos") ?? 0
             let clusterCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM clusters") ?? 0
-            let skippedCount = try Int.fetchOne(
-                db, sql: "SELECT COUNT(*) FROM photos WHERE is_local = 0 OR file_path IS NULL") ?? 0
-            return (photoCount, clusterCount, skippedCount)
+            return (photoCount, clusterCount)
         }
 
         var displayState = state.state
@@ -231,7 +257,7 @@ actor LocalBackend {
             state: displayState,
             totalPhotos: state.totalPhotos > 0 ? state.totalPhotos : photoCount,
             scanned: scanned,
-            skippedCloud: state.skippedCloud > 0 ? state.skippedCloud : skippedCount,
+            skippedCloud: state.skippedCloud,
             clustersFound: clusterCount,
             error: state.error,
             elapsedSeconds: elapsed

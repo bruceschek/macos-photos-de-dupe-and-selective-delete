@@ -42,7 +42,6 @@ final class PhotoLibraryBridge {
         case idle
         case enumerating
         case ingesting(current: Int, total: Int)
-        case downloading(current: Int, total: Int)
         case done
         case failed(String)
     }
@@ -73,33 +72,13 @@ final class PhotoLibraryBridge {
         let total = imageResult.count + videoResult.count
         print("[Bridge] \(imageResult.count) images + \(videoResult.count) videos = \(total) total")
 
-        // Phase 1: ingest all metadata in batches (background thread for PHAssetResource)
-        let cloudImageAssets = try await ingestFetchResult(
-            imageResult, libraryURL: libraryURL, total: total, offset: 0, trackCloud: true)
+        // Ingest all metadata in batches (background thread for PHAssetResource).
+        // No pre-download pass: hashing pulls thumbnails straight from
+        // PhotoKit, which covers iCloud-only assets on demand.
         try await ingestFetchResult(
-            videoResult, libraryURL: libraryURL, total: total, offset: imageResult.count, trackCloud: false)
-
-        // Phase 2: download 512×512 previews for iCloud-only images so LocalBackend can hash them
-        //          Videos are intentionally excluded — no downloads triggered for video
-        if !cloudImageAssets.isEmpty {
-            print("[Bridge] \(cloudImageAssets.count) iCloud images need thumbnail download")
-            let cacheDir = Self.makeCacheDir()
-            for (index, (uuid, asset)) in cloudImageAssets.enumerated() {
-                phase = .downloading(current: index, total: cloudImageAssets.count)
-                let cachePath = cacheDir.appendingPathComponent("\(uuid).jpg").path
-
-                if !FileManager.default.fileExists(atPath: cachePath) {
-                    if let img = await requestPreview(for: asset) {
-                        Self.saveJPEG(img, to: cachePath)
-                    }
-                }
-
-                if FileManager.default.fileExists(atPath: cachePath) {
-                    try? await LocalBackend.shared.updateFilePath(uuid: uuid, path: cachePath)
-                }
-            }
-            phase = .downloading(current: cloudImageAssets.count, total: cloudImageAssets.count)
-        }
+            imageResult, libraryURL: libraryURL, total: total, offset: 0)
+        try await ingestFetchResult(
+            videoResult, libraryURL: libraryURL, total: total, offset: imageResult.count)
 
         print("[Bridge] All ingestion done. Starting hashing.")
         try await LocalBackend.shared.startHashing()
@@ -108,15 +87,12 @@ final class PhotoLibraryBridge {
 
     // MARK: - Private helpers
 
-    @discardableResult
     private func ingestFetchResult(
         _ result: PHFetchResult<PHAsset>,
         libraryURL: URL,
         total: Int,
-        offset: Int,
-        trackCloud: Bool
-    ) async throws -> [(String, PHAsset)] {
-        var cloudAssets: [(String, PHAsset)] = []
+        offset: Int
+    ) async throws {
         let count = result.count
         let batchSize = 300
         var cursor = 0
@@ -132,38 +108,9 @@ final class PhotoLibraryBridge {
                 }
             }
 
-            if trackCloud {
-                for (record, asset) in zip(records, assets) where !record.isLocal {
-                    cloudAssets.append((record.uuid, asset))
-                }
-            }
-
             try await LocalBackend.shared.ingestBatch(records)
             cursor = end
             phase = .ingesting(current: offset + cursor, total: total)
-        }
-        return cloudAssets
-    }
-
-    // Downloads a 512×512 preview — triggers minimal iCloud download, NOT the full original
-    private func requestPreview(for asset: PHAsset) async -> NSImage? {
-        await withCheckedContinuation { cont in
-            let options = PHImageRequestOptions()
-            options.deliveryMode = .highQualityFormat
-            options.isNetworkAccessAllowed = true   // allowed for images, not called for videos
-            options.isSynchronous = false
-
-            var resumed = false
-            PHImageManager.default().requestImage(
-                for: asset,
-                targetSize: CGSize(width: 512, height: 512),
-                contentMode: .aspectFit,
-                options: options
-            ) { img, info in
-                let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
-                if isDegraded { return }
-                if !resumed { resumed = true; cont.resume(returning: img) }
-            }
         }
     }
 
@@ -217,21 +164,6 @@ final class PhotoLibraryBridge {
             mediaType: isVideo ? "video" : "image",
             duration: isVideo ? asset.duration : nil
         )
-    }
-
-    private static func saveJPEG(_ image: NSImage, to path: String) {
-        guard let tiff = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiff),
-              let data = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.85])
-        else { return }
-        try? data.write(to: URL(fileURLWithPath: path))
-    }
-
-    private static func makeCacheDir() -> URL {
-        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("com.bruceschechter.PhotoDedup/thumbnails")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
     }
 
     private static func findPhotosLibraryURL() -> URL {
