@@ -20,8 +20,14 @@ extension Backend {
     }
 }
 
-/// Single dependency-injection point. Views call `CurrentBackend.shared` so we
-/// can flip implementations from one place once `LocalBackend` lands.
+/// Single dependency-injection point. Views call `CurrentBackend.shared`.
+/// Gated by `useLocalBackend` (default `false`): the native `LocalBackend`
+/// skeleton exists but doesn't hash or cluster yet, so Python stays the
+/// default until that lands.
 enum CurrentBackend {
-    static var shared: any Backend { RemoteBackend.shared }
+    static let useLocalBackendKey = "useLocalBackend"
+
+    static var shared: any Backend {
+        UserDefaults.standard.bool(forKey: useLocalBackendKey) ? LocalBackend.shared : RemoteBackend.shared
+    }
 }

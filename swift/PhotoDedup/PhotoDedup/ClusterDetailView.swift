@@ -425,16 +425,16 @@ struct LightboxView: View {
                         Text(current.filename).font(.headline).foregroundStyle(.white)
                         HStack(spacing: 8) {
                             if let ts = current.dateTaken {
-                                Text(formattedDate(ts)).font(.caption).foregroundStyle(.white.opacity(0.65))
+                                Text(formattedDate(ts)).font(AppFont.base).foregroundStyle(.white.opacity(0.65))
                             }
                             if let w = current.width, let h = current.height {
-                                Text("\(w)×\(h)").font(.caption).foregroundStyle(.white.opacity(0.65))
+                                Text("\(w)×\(h)").font(AppFont.base).foregroundStyle(.white.opacity(0.65))
                             }
                         }
                     }
                     Spacer()
                     Text("\(currentIndex + 1) / \(localPhotos.count)")
-                        .font(.callout.monospacedDigit()).foregroundStyle(.white.opacity(0.65))
+                        .font(AppFont.label.monospacedDigit()).foregroundStyle(.white.opacity(0.65))
                     Button(action: openInPhotos) {
                         Label("Open in Photos", systemImage: "arrow.up.forward.app")
                             .padding(.horizontal, 4)

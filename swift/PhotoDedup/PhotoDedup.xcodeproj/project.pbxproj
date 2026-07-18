@@ -17,6 +17,9 @@
 		DA2B3C4D5E6F708192A3B465 /* ClusterDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA2B3C4D5E6F708192A3B455 /* ClusterDetailView.swift */; };
 		DA2B3C4D5E6F708192A3B466 /* ServerManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA2B3C4D5E6F708192A3B456 /* ServerManager.swift */; };
 		DA2B3C4D5E6F708192A3B467 /* PhotoLibraryBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA2B3C4D5E6F708192A3B457 /* PhotoLibraryBridge.swift */; };
+		1AF684A8280BE5689BE463B4 /* GRDB in Frameworks */ = {isa = PBXBuildFile; productRef = 776262B6A0B18416F1B99A70 /* GRDB */; };
+		E308B477320A47D8D3760114 /* PhotoStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8E77DFB34917DA0ED2E87CD /* PhotoStore.swift */; };
+		D5FC12E823832C5083D5285E /* LocalBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 233A084C11F517FD1EC11CFC /* LocalBackend.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -32,6 +35,8 @@
 		DA2B3C4D5E6F708192A3B455 /* ClusterDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClusterDetailView.swift; sourceTree = "<group>"; };
 		DA2B3C4D5E6F708192A3B456 /* ServerManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerManager.swift; sourceTree = "<group>"; };
 		DA2B3C4D5E6F708192A3B457 /* PhotoLibraryBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoLibraryBridge.swift; sourceTree = "<group>"; };
+		C8E77DFB34917DA0ED2E87CD /* PhotoStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoStore.swift; sourceTree = "<group>"; };
+		233A084C11F517FD1EC11CFC /* LocalBackend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalBackend.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -39,6 +44,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				1AF684A8280BE5689BE463B4 /* GRDB in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -74,6 +80,8 @@
 				DA2B3C4D5E6F708192A3B455 /* ClusterDetailView.swift */,
 				DA2B3C4D5E6F708192A3B456 /* ServerManager.swift */,
 				DA2B3C4D5E6F708192A3B457 /* PhotoLibraryBridge.swift */,
+				C8E77DFB34917DA0ED2E87CD /* PhotoStore.swift */,
+				233A084C11F517FD1EC11CFC /* LocalBackend.swift */,
 				DA2B3C4D5E6F708192A3B450 /* PhotoDedup.entitlements */,
 			);
 			path = PhotoDedup;
@@ -95,6 +103,9 @@
 			dependencies = (
 			);
 			name = PhotoDedup;
+			packageProductDependencies = (
+				776262B6A0B18416F1B99A70 /* GRDB */,
+			);
 			productName = PhotoDedup;
 			productReference = DA2B3C4D5E6F708192A3B440 /* PhotoDedup.app */;
 			productType = "com.apple.product-type.application";
@@ -123,6 +134,9 @@
 				Base,
 			);
 			mainGroup = DA2B3C4D5E6F708192A3B402;
+			packageReferences = (
+				6BDEF3A43B4507668CC4BA22 /* XCRemoteSwiftPackageReference "GRDB.swift" */,
+			);
 			productRefGroup = DA2B3C4D5E6F708192A3B403 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -157,6 +171,8 @@
 				DA2B3C4D5E6F708192A3B465 /* ClusterDetailView.swift in Sources */,
 				DA2B3C4D5E6F708192A3B466 /* ServerManager.swift in Sources */,
 				DA2B3C4D5E6F708192A3B467 /* PhotoLibraryBridge.swift in Sources */,
+				E308B477320A47D8D3760114 /* PhotoStore.swift in Sources */,
+				D5FC12E823832C5083D5285E /* LocalBackend.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -344,6 +360,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		6BDEF3A43B4507668CC4BA22 /* XCRemoteSwiftPackageReference "GRDB.swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/groue/GRDB.swift";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 7.0.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		776262B6A0B18416F1B99A70 /* GRDB */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 6BDEF3A43B4507668CC4BA22 /* XCRemoteSwiftPackageReference "GRDB.swift" */;
+			productName = GRDB;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = DA2B3C4D5E6F708192A3B401 /* Project object */;
 }
