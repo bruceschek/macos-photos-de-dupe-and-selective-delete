@@ -11,10 +11,24 @@ enum LocalBackendError: Error, LocalizedError {
     }
 }
 
+private struct HashCandidate: Sendable {
+    let uuid: String
+    let path: String
+}
+
+private extension Array {
+    func chunked(into size: Int) -> [[Element]] {
+        stride(from: 0, to: count, by: size).map {
+            Array(self[$0..<Swift.min($0 + size, count)])
+        }
+    }
+}
+
 /// Native Swift implementation of `Backend`, backed by `PhotoStore` (GRDB).
-/// Mirrors `python/ml/scanner.py`'s ingest + status bookkeeping exactly.
-/// `startHashing()` is a no-op stub — native pHash/clustering lands in the
-/// next migration slice.
+/// Mirrors `python/ml/scanner.py`'s ingest, hashing-pipeline, and status
+/// bookkeeping. Hashing uses `PHash` (native `imagehash.phash` port, with
+/// AVFoundation replacing ffmpeg for video frames); clustering uses
+/// `Clusterer` (port of all five cluster kinds).
 actor LocalBackend: Backend {
     static let shared = LocalBackend()
 
@@ -30,8 +44,13 @@ actor LocalBackend: Backend {
 
     private let store = PhotoStore.shared
     private var state = ScanState()
+    private var pipelineTask: Task<Void, Never>?
+    private var pipelineGeneration = 0
 
     func beginScan() async throws {
+        pipelineGeneration += 1
+        pipelineTask?.cancel()
+        pipelineTask = nil
         try await store.write { db in
             try db.execute(sql: "DELETE FROM cluster_members")
             try db.execute(sql: "DELETE FROM clusters")
@@ -73,7 +92,111 @@ actor LocalBackend: Backend {
     }
 
     func startHashing() async throws {
-        state.state = "done"
+        // Mirrors Python's non-blocking lock: a second call while the
+        // pipeline runs is a no-op.
+        guard pipelineTask == nil else { return }
+        pipelineGeneration += 1
+        let generation = pipelineGeneration
+        state.state = "hashing"
+        state.scanned = 0
+        state.error = nil
+        pipelineTask = Task { await self.runPipeline(generation: generation) }
+    }
+
+    // MARK: - Hashing + clustering pipeline (port of scanner._run_hashing)
+
+    private func runPipeline(generation: Int) async {
+        defer {
+            if pipelineGeneration == generation { pipelineTask = nil }
+        }
+        do {
+            try await hashPhotos(generation: generation)
+            guard pipelineGeneration == generation else { return }
+            state.state = "clustering"
+            let clusterCount = try await store.write { db in
+                try Clusterer.buildClusters(db)
+            }
+            guard pipelineGeneration == generation else { return }
+            state.state = "done"
+            print("[LocalBackend] Scan complete — \(clusterCount) clusters")
+        } catch is CancellationError {
+            // beginScan superseded this run; it already reset the state.
+        } catch {
+            guard pipelineGeneration == generation else { return }
+            state.state = "error"
+            state.error = error.localizedDescription
+            print("[LocalBackend] Pipeline failed: \(error)")
+        }
+    }
+
+    private func hashPhotos(generation: Int) async throws {
+        let (imageRows, videoRows, total, skipped) = try await store.read {
+            db -> ([HashCandidate], [HashCandidate], Int, Int) in
+            let images = try Row.fetchAll(db, sql: """
+                SELECT uuid, file_path FROM photos
+                WHERE file_path IS NOT NULL AND is_local = 1 AND media_type = 'image'
+                """).map { HashCandidate(uuid: $0["uuid"], path: $0["file_path"]) }
+            let videos = try Row.fetchAll(db, sql: """
+                SELECT uuid, file_path FROM photos
+                WHERE file_path IS NOT NULL AND is_local = 1 AND media_type = 'video'
+                """).map { HashCandidate(uuid: $0["uuid"], path: $0["file_path"]) }
+            let total = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM photos") ?? 0
+            let skipped = try Int.fetchOne(db, sql:
+                "SELECT COUNT(*) FROM photos WHERE is_local = 0 OR file_path IS NULL") ?? 0
+            return (images, videos, total, skipped)
+        }
+        guard pipelineGeneration == generation else { return }
+        state.totalPhotos = total
+        state.skippedCloud = skipped
+
+        var scanned = 0
+        for chunk in imageRows.chunked(into: 32) {
+            try Task.checkCancellation()
+            try await writeHashes(computedFor: chunk, video: false)
+            scanned += chunk.count
+            guard pipelineGeneration == generation else { return }
+            state.scanned = scanned
+        }
+        for chunk in videoRows.chunked(into: 8) {
+            try Task.checkCancellation()
+            try await writeHashes(computedFor: chunk, video: true)
+            scanned += chunk.count
+            guard pipelineGeneration == generation else { return }
+            state.scanned = scanned
+        }
+    }
+
+    private func writeHashes(computedFor chunk: [HashCandidate], video: Bool) async throws {
+        let results = await Self.computeHashes(chunk, video: video)
+        guard !results.isEmpty else { return }
+        try await store.write { db in
+            for (uuid, hash) in results {
+                try db.execute(sql: "UPDATE photos SET phash=? WHERE uuid=?",
+                               arguments: [hash, uuid])
+            }
+        }
+    }
+
+    /// nonisolated so the task-group children run on the global concurrent
+    /// executor instead of serializing on this actor.
+    private nonisolated static func computeHashes(
+        _ chunk: [HashCandidate], video: Bool
+    ) async -> [(String, String)] {
+        await withTaskGroup(of: (String, String?).self) { group in
+            for candidate in chunk {
+                group.addTask {
+                    if video {
+                        return (candidate.uuid, await PHash.hash(videoAt: candidate.path))
+                    }
+                    return (candidate.uuid, PHash.hash(imageAt: candidate.path))
+                }
+            }
+            var results: [(String, String)] = []
+            for await (uuid, hash) in group {
+                if let hash { results.append((uuid, hash)) }
+            }
+            return results
+        }
     }
 
     func status() async throws -> ScanStatus {

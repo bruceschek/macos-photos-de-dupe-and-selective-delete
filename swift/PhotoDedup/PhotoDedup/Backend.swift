@@ -21,9 +21,9 @@ extension Backend {
 }
 
 /// Single dependency-injection point. Views call `CurrentBackend.shared`.
-/// Gated by `useLocalBackend` (default `false`): the native `LocalBackend`
-/// skeleton exists but doesn't hash or cluster yet, so Python stays the
-/// default until that lands.
+/// `useLocalBackend` defaults to `true` (registered in `PhotoDedupApp.init`):
+/// the native backend covers the full scan → hash → cluster pipeline, so
+/// Python is opt-in via Settings for anyone who wants the old path back.
 enum CurrentBackend {
     static let useLocalBackendKey = "useLocalBackend"
 

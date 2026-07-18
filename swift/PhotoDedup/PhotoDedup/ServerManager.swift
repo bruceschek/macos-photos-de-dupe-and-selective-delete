@@ -27,7 +27,7 @@ final class ServerManager {
         }
     }
 
-    private static var defaultPythonPath: String {
+    nonisolated static var defaultPythonPath: String {
         let home = NSHomeDirectory()
         return "\(home)/dev/swift/012-photo-app-de-dupe-and-deletion/python/ml"
     }

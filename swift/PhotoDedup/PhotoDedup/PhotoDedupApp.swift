@@ -2,20 +2,39 @@ import SwiftUI
 
 @main
 struct PhotoDedupApp: App {
+    init() {
+        // Native backend is the default; the Python path is opt-in via Settings.
+        UserDefaults.standard.register(defaults: [CurrentBackend.useLocalBackendKey: true])
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView()
         }
         .defaultSize(width: 1200, height: 800)
+
+        Settings {
+            SettingsView()
+        }
     }
 }
 
 // MARK: - Root routing view
 
 struct RootView: View {
+    @AppStorage(CurrentBackend.useLocalBackendKey) private var useLocalBackend = true
     private let server = ServerManager.shared
 
     var body: some View {
+        if useLocalBackend {
+            ClusterListView()
+                .onAppear { server.stop() }   // no Python process in native mode
+        } else {
+            remoteBody
+        }
+    }
+
+    private var remoteBody: some View {
         Group {
             switch server.state {
             case .notStarted, .launching:
@@ -27,6 +46,36 @@ struct RootView: View {
             }
         }
         .task { await server.startIfNeeded() }
+    }
+}
+
+// MARK: - Settings
+
+struct SettingsView: View {
+    @AppStorage(CurrentBackend.useLocalBackendKey) private var useLocalBackend = true
+    @AppStorage("pythonProjectPath") private var pythonProjectPath = ServerManager.defaultPythonPath
+
+    var body: some View {
+        Form {
+            Section("Backend") {
+                Toggle("Use native Swift backend", isOn: $useLocalBackend)
+                Text(useLocalBackend
+                     ? "Scanning, hashing, and clustering run inside the app. Python is not required."
+                     : "The app launches the Python FastAPI backend and talks to it over HTTP. Requires 'uv'.")
+                    .font(AppFont.small)
+                    .foregroundStyle(.secondary)
+            }
+            if !useLocalBackend {
+                Section("Python") {
+                    TextField("Project path", text: $pythonProjectPath)
+                    Text("Folder containing main.py — launched with 'uv run python main.py'.")
+                        .font(AppFont.small)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 480)
     }
 }
 
