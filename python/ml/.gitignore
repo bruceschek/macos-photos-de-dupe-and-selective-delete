@@ -1,0 +1,15 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Runtime data
+photos.db
+photos.db-shm
+photos.db-wal
+
+# Virtual environments
+.venv
