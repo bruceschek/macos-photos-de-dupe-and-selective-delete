@@ -38,11 +38,27 @@ struct ClusterSummary: Codable, Identifiable, Hashable, Sendable {
     let confidence: Double
     let memberCount: Int
     let representativeUuid: String
+    let representativeIdentifier: String?   // PHAsset localIdentifier for the row thumbnail
+    let caption: String?                    // Vision 2–3 word scene label, nil until captioned
 
     enum CodingKeys: String, CodingKey {
-        case id, kind, confidence
+        case id, kind, confidence, caption
         case memberCount = "member_count"
         case representativeUuid = "representative_uuid"
+        case representativeIdentifier = "representative_identifier"
+    }
+}
+
+enum ClusterSort: String, CaseIterable, Identifiable, Sendable {
+    case duplicates   // most photos first (default)
+    case date         // newest photo in the group first
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .duplicates: "Number of Duplicates"
+        case .date: "Date"
+        }
     }
 }
 

@@ -1,6 +1,8 @@
 import Foundation
 import GRDB
 import os
+import Photos
+import AppKit
 
 enum LocalBackendError: Error, LocalizedError {
     case clusterNotFound(Int)
@@ -84,6 +86,26 @@ actor LocalBackend {
         state.totalPhotos = ingested
     }
 
+    /// Removes committed-deleted photos from the store so they don't reappear
+    /// on the next cluster load. `cluster_members` rows cascade with the photo;
+    /// clusters left with fewer than two members are no longer duplicates and
+    /// are dropped too, so emptied groups vanish from the list.
+    func removePhotos(uuids: [String]) async {
+        guard !uuids.isEmpty else { return }
+        try? await store.write { db in
+            for uuid in uuids {
+                try db.execute(sql: "DELETE FROM photos WHERE uuid = ?", arguments: [uuid])
+            }
+            try db.execute(sql: """
+                DELETE FROM clusters WHERE id IN (
+                    SELECT c.id FROM clusters c
+                    LEFT JOIN cluster_members cm ON cm.cluster_id = c.id
+                    GROUP BY c.id HAVING COUNT(cm.photo_uuid) < 2
+                )
+                """)
+        }
+    }
+
     func startHashing() async throws {
         // Mirrors Python's non-blocking lock: a second call while the
         // pipeline runs is a no-op.
@@ -103,9 +125,26 @@ actor LocalBackend {
             if pipelineGeneration == generation { pipelineTask = nil }
         }
         do {
+            // Live clustering: rebuild groups periodically while hashing runs so
+            // duplicates surface in the sidebar in real time instead of only at
+            // the end. Metadata-based kinds (burst/RAW+JPEG/Live) appear almost
+            // immediately; pHash groups fill in as hashes land.
+            let liveClustering = Task { await self.runLiveClustering(generation: generation) }
+
             let hashInterval = signposter.beginInterval("hashing")
-            try await hashPhotos(generation: generation)
+            do {
+                try await hashPhotos(generation: generation)
+            } catch {
+                liveClustering.cancel()
+                _ = await liveClustering.value
+                throw error
+            }
             signposter.endInterval("hashing", hashInterval)
+
+            // Stop live clustering before the authoritative final pass so the two
+            // don't overlap.
+            liveClustering.cancel()
+            _ = await liveClustering.value
 
             guard pipelineGeneration == generation else { return }
             state.state = "clustering"
@@ -114,6 +153,11 @@ actor LocalBackend {
                 try Clusterer.buildClusters(db)
             }
             signposter.endInterval("clustering", clusterInterval)
+
+            guard pipelineGeneration == generation else { return }
+            let captionInterval = signposter.beginInterval("captioning")
+            await captionClusters(generation: generation)
+            signposter.endInterval("captioning", captionInterval)
 
             guard pipelineGeneration == generation else { return }
             state.state = "done"
@@ -125,6 +169,31 @@ actor LocalBackend {
             state.state = "error"
             state.error = error.localizedDescription
             print("[LocalBackend] Pipeline failed: \(error)")
+        }
+    }
+
+    /// Periodically rebuilds clusters while hashing is in flight so the UI can
+    /// show duplicates as they're discovered. Skips a rebuild when no new hashes
+    /// have landed since the last one, and treats failures as non-fatal (the
+    /// final clustering pass is authoritative). Runs until cancelled by
+    /// `runPipeline` when hashing finishes.
+    private func runLiveClustering(generation: Int) async {
+        let interval = Duration.seconds(4)
+        var lastScanned = -1
+        while pipelineGeneration == generation && !Task.isCancelled {
+            do {
+                try await Task.sleep(for: interval)
+            } catch {
+                return   // cancelled
+            }
+            guard pipelineGeneration == generation, !Task.isCancelled else { return }
+            guard state.scanned != lastScanned else { continue }
+            lastScanned = state.scanned
+            do {
+                _ = try await store.write { db in try Clusterer.buildClusters(db) }
+            } catch {
+                print("[LocalBackend] Live clustering pass failed (non-fatal): \(error)")
+            }
         }
     }
 
@@ -225,6 +294,99 @@ actor LocalBackend {
         }
     }
 
+    // MARK: - Captioning (Vision scene classification)
+
+    /// Labels each freshly-built cluster with a short 2–3 word Vision
+    /// classification of its representative photo (e.g. "Beach, Sky"). Runs in
+    /// bounded-concurrency chunks so image loading + classification overlap
+    /// without loading every representative into memory at once. Only clusters
+    /// whose caption is still NULL are processed, so re-runs are cheap.
+    private func captionClusters(generation: Int) async {
+        let targets: [(id: Int, identifier: String)]
+        do {
+            targets = try await store.read { db in
+                try Row.fetchAll(db, sql: """
+                    SELECT c.id AS id,
+                           (SELECT p.local_identifier
+                              FROM photos p
+                              JOIN cluster_members cm ON cm.photo_uuid = p.uuid
+                             WHERE cm.cluster_id = c.id AND p.local_identifier IS NOT NULL
+                             ORDER BY p.uuid
+                             LIMIT 1) AS identifier
+                    FROM clusters c
+                    WHERE c.caption IS NULL
+                    """).compactMap { row in
+                        guard let identifier: String = row["identifier"] else { return nil }
+                        return (id: row["id"] as Int, identifier: identifier)
+                    }
+            }
+        } catch {
+            print("[LocalBackend] Caption query failed: \(error)")
+            return
+        }
+        guard !targets.isEmpty else { return }
+
+        let chunkSize = 6
+        var index = 0
+        while index < targets.count {
+            guard pipelineGeneration == generation else { return }
+            let chunk = Array(targets[index..<min(index + chunkSize, targets.count)])
+            index += chunkSize
+
+            let results = await withTaskGroup(of: (Int, String?).self) { group in
+                for target in chunk {
+                    group.addTask { (target.id, await Self.caption(for: target.identifier)) }
+                }
+                var acc: [(Int, String)] = []
+                for await (id, caption) in group {
+                    if let caption { acc.append((id, caption)) }
+                }
+                return acc
+            }
+
+            guard !results.isEmpty, pipelineGeneration == generation else { continue }
+            try? await store.write { db in
+                for (id, caption) in results {
+                    try db.execute(
+                        sql: "UPDATE clusters SET caption=? WHERE id=?",
+                        arguments: [caption, id])
+                }
+            }
+        }
+    }
+
+    /// Loads the representative image and returns its short scene label. Static
+    /// (nonisolated) so image decode + Vision run off the actor.
+    private static func caption(for localIdentifier: String) async -> String? {
+        guard let cgImage = await loadCGImage(localIdentifier: localIdentifier) else { return nil }
+        return ImageClassifier.label(for: cgImage)
+    }
+
+    /// PHAsset localIdentifier → downscaled CGImage suitable for classification.
+    private static func loadCGImage(localIdentifier: String, maxDimension: CGFloat = 300) async -> CGImage? {
+        await withCheckedContinuation { (continuation: CheckedContinuation<CGImage?, Never>) in
+            let assets = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: nil)
+            guard let asset = assets.firstObject else {
+                continuation.resume(returning: nil); return
+            }
+            let options = PHImageRequestOptions()
+            options.deliveryMode = .highQualityFormat   // single callback, no degraded pass
+            options.isNetworkAccessAllowed = true
+            options.isSynchronous = false
+            options.resizeMode = .fast
+            PHImageManager.default().requestImage(
+                for: asset,
+                targetSize: CGSize(width: maxDimension, height: maxDimension),
+                contentMode: .aspectFit,
+                options: options
+            ) { image, _ in
+                guard let image else { continuation.resume(returning: nil); return }
+                var rect = CGRect(origin: .zero, size: image.size)
+                continuation.resume(returning: image.cgImage(forProposedRect: &rect, context: nil, hints: nil))
+            }
+        }
+    }
+
     func status() async throws -> ScanStatus {
         let (photoCount, clusterCount) = try await store.read { db -> (Int, Int) in
             let photoCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM photos") ?? 0
@@ -264,16 +426,24 @@ actor LocalBackend {
         )
     }
 
-    func clusters(page: Int = 1, kind: String? = nil) async throws -> [ClusterSummary] {
+    func clusters(page: Int = 1, kind: String? = nil, sort: ClusterSort = .duplicates) async throws -> [ClusterSummary] {
         let pageSize = 50
         let offset = (page - 1) * pageSize
         return try await store.read { db in
             var sql = """
-                SELECT c.id, c.kind, c.confidence,
+                SELECT c.id, c.kind, c.confidence, c.caption,
                        COUNT(cm.photo_uuid) as member_count,
-                       MIN(cm.photo_uuid)   as representative_uuid
+                       MIN(cm.photo_uuid)   as representative_uuid,
+                       MAX(p.date_taken)    as latest_date,
+                       (SELECT p2.local_identifier
+                          FROM photos p2
+                          JOIN cluster_members cm2 ON cm2.photo_uuid = p2.uuid
+                         WHERE cm2.cluster_id = c.id
+                         ORDER BY p2.uuid
+                         LIMIT 1)          as representative_identifier
                 FROM clusters c
                 JOIN cluster_members cm ON cm.cluster_id = c.id
+                JOIN photos p ON p.uuid = cm.photo_uuid
                 WHERE 1=1
                 """
             var arguments: [DatabaseValueConvertible?] = []
@@ -281,10 +451,15 @@ actor LocalBackend {
                 sql += " AND c.kind = ?"
                 arguments.append(kind)
             }
+            let orderClause: String
+            switch sort {
+            case .duplicates: orderClause = "member_count DESC, c.confidence DESC"
+            case .date:       orderClause = "latest_date DESC, member_count DESC"
+            }
             sql += """
 
                 GROUP BY c.id
-                ORDER BY c.confidence DESC, member_count DESC
+                ORDER BY \(orderClause)
                 LIMIT ? OFFSET ?
                 """
             arguments.append(pageSize)
@@ -297,7 +472,9 @@ actor LocalBackend {
                     kind: row["kind"],
                     confidence: row["confidence"],
                     memberCount: row["member_count"],
-                    representativeUuid: row["representative_uuid"]
+                    representativeUuid: row["representative_uuid"],
+                    representativeIdentifier: row["representative_identifier"],
+                    caption: row["caption"]
                 )
             }
         }

@@ -150,6 +150,11 @@ actor PhotoStore {
             // sampled frame hashes for videos. Comma-joined hex, primary first.
             try db.execute(sql: "ALTER TABLE photos ADD COLUMN phash_variants TEXT")
         }
+        migrator.registerMigration("v3") { db in
+            // Short 2–3 word Vision classification of the cluster's representative
+            // photo (e.g. "Beach, Sky"). Populated during the clustering pass.
+            try db.execute(sql: "ALTER TABLE clusters ADD COLUMN caption TEXT")
+        }
         try! migrator.migrate(dbQueue)
     }
 

@@ -25,24 +25,68 @@ enum Clusterer {
     // 1.20 lets 5:4 vs 4:3 pass; landscape vs portrait fails immediately.
     private static let videoAspectRatioMaxRatio = 1.20
 
-    /// Rebuilds all clusters from scratch. Returns the cluster count.
-    static func buildClusters(_ db: Database) throws -> Int {
-        let now = Date().timeIntervalSince1970
-        try db.execute(sql: "DELETE FROM cluster_members")
-        try db.execute(sql: "DELETE FROM clusters")
+    /// One candidate group, not yet written to the DB. Collecting all passes'
+    /// output before touching `clusters` lets `buildClusters` diff against what
+    /// is already there instead of blindly delete-and-reinsert.
+    private struct ProposedCluster {
+        let kind: String
+        let confidence: Double
+        let members: [String]
+    }
 
-        try clusterBursts(db, now: now)
-        try clusterRawJpeg(db, now: now)
-        try clusterLivePhotos(db, now: now)
-        try clusterPhash(db, now: now)
-        try clusterVideos(db, now: now)
+    /// Rebuilds clusters, preserving the row (and id) of any cluster whose kind
+    /// and exact member set didn't change since the last build. Live clustering
+    /// runs this every few seconds while hashing is still in flight; without
+    /// diffing, every pass would delete and recreate every cluster with a new
+    /// autoincrement id, and the sidebar/detail selection would jump around
+    /// under the user mid-scan even though most groups aren't actually
+    /// changing. Returns the final cluster count.
+    static func buildClusters(_ db: Database) throws -> Int {
+        var proposed: [ProposedCluster] = []
+        try clusterBursts(db, &proposed)
+        try clusterRawJpeg(db, &proposed)
+        try clusterLivePhotos(db, &proposed)
+        try clusterPhash(db, &proposed)
+        try clusterVideos(db, &proposed)
+
+        let existing = try Row.fetchAll(db, sql: """
+            SELECT c.id, c.kind, GROUP_CONCAT(cm.photo_uuid) as members
+            FROM clusters c
+            LEFT JOIN cluster_members cm ON cm.cluster_id = c.id
+            GROUP BY c.id
+            """)
+        var existingIdBySignature: [String: Int64] = [:]
+        for row in existing {
+            let members: String? = row["members"]
+            let sorted = (members ?? "").split(separator: ",").sorted().joined(separator: ",")
+            existingIdBySignature["\(row["kind"] as String)|\(sorted)"] = row["id"]
+        }
+
+        let now = Date().timeIntervalSince1970
+        var keptIds = Set<Int64>()
+        for cluster in proposed {
+            let sorted = cluster.members.sorted().joined(separator: ",")
+            let signature = "\(cluster.kind)|\(sorted)"
+            if let existingId = existingIdBySignature[signature] {
+                keptIds.insert(existingId)   // unchanged — leave row (and caption) alone
+            } else {
+                try insertCluster(db, kind: cluster.kind, confidence: cluster.confidence,
+                                  now: now, members: cluster.members)
+            }
+        }
+
+        let staleIds = Set(existingIdBySignature.values).subtracting(keptIds)
+        if !staleIds.isEmpty {
+            try db.execute(
+                sql: "DELETE FROM clusters WHERE id IN (\(staleIds.map(String.init).joined(separator: ",")))")
+        }
 
         return try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM clusters") ?? 0
     }
 
     // MARK: - Cluster kinds
 
-    private static func clusterBursts(_ db: Database, now: Double) throws {
+    private static func clusterBursts(_ db: Database, _ proposed: inout [ProposedCluster]) throws {
         let rows = try Row.fetchAll(db, sql: """
             SELECT burst_uuid, GROUP_CONCAT(uuid) as uuids
             FROM photos WHERE burst_uuid IS NOT NULL
@@ -50,8 +94,8 @@ enum Clusterer {
             """)
         for row in rows {
             let joined: String = row["uuids"]
-            try insertCluster(db, kind: "burst", confidence: 1.0, now: now,
-                              members: joined.components(separatedBy: ","))
+            proposed.append(ProposedCluster(kind: "burst", confidence: 1.0,
+                              members: joined.components(separatedBy: ",")))
         }
     }
 
@@ -61,7 +105,7 @@ enum Clusterer {
         let dateTaken: Double
     }
 
-    private static func clusterRawJpeg(_ db: Database, now: Double) throws {
+    private static func clusterRawJpeg(_ db: Database, _ proposed: inout [ProposedCluster]) throws {
         let rows = try Row.fetchAll(db, sql: """
             SELECT uuid, original_filename, is_raw, date_taken FROM photos
             WHERE is_raw = 1
@@ -89,13 +133,13 @@ enum Clusterer {
                       group.contains(where: \.isRaw),
                       group.contains(where: { !$0.isRaw })
                 else { continue }
-                try insertCluster(db, kind: "raw_jpeg", confidence: 1.0, now: now,
-                                  members: group.map(\.uuid))
+                proposed.append(ProposedCluster(kind: "raw_jpeg", confidence: 1.0,
+                                  members: group.map(\.uuid)))
             }
         }
     }
 
-    private static func clusterLivePhotos(_ db: Database, now: Double) throws {
+    private static func clusterLivePhotos(_ db: Database, _ proposed: inout [ProposedCluster]) throws {
         // Only cluster by burst_uuid — filename-stem matching is too broad
         // (see genericStems note above).
         let rows = try Row.fetchAll(db, sql:
@@ -105,15 +149,30 @@ enum Clusterer {
             groups[row["burst_uuid"], default: []].append(row["uuid"])
         }
         for uuids in groups.values where uuids.count > 1 {
-            try insertCluster(db, kind: "live", confidence: 1.0, now: now, members: uuids)
+            proposed.append(ProposedCluster(kind: "live", confidence: 1.0, members: uuids))
         }
     }
 
-    private static func clusterPhash(_ db: Database, now: Double) throws {
-        let rows = try Row.fetchAll(db, sql:
-            "SELECT uuid, phash, phash_variants FROM photos WHERE phash IS NOT NULL")
+    private struct PhashEntry {
+        let uuid: String
+        let primary: UInt64
+        let variants: [UInt64]
+    }
 
-        var entries: [(uuid: String, primary: UInt64, variants: [UInt64])] = []
+    private static func clusterPhash(_ db: Database, _ proposed: inout [ProposedCluster]) throws {
+        // Videos are excluded here: their sampled-frame hashes live in the same
+        // hash space as photo hashes, but pooling the two lets a video's frame
+        // (however visually unrelated) chain-match a still image by DCT
+        // coincidence — most often with near-black or near-blank frames, which
+        // are common in old digitized footage. Videos get their own funnel in
+        // clusterVideos, gated on filename/time/duration, not just raw hash
+        // proximity.
+        let rows = try Row.fetchAll(db, sql: """
+            SELECT uuid, phash, phash_variants FROM photos
+            WHERE phash IS NOT NULL AND media_type != 'video'
+            """)
+
+        var entries: [PhashEntry] = []
         for row in rows {
             let hex: String = row["phash"]
             guard let primary = UInt64(hex, radix: 16) else { continue }
@@ -122,13 +181,17 @@ enum Clusterer {
             let bitCount = primary.nonzeroBitCount
             if bitCount <= phashMinBits || bitCount >= phashMaxBits { continue }
             let variants = parseVariants(row["phash_variants"], fallback: primary)
-            entries.append((row["uuid"], primary, variants))
+            entries.append(PhashEntry(uuid: row["uuid"], primary: primary, variants: variants))
         }
         guard !entries.isEmpty else { return }
 
         // Tree holds primary hashes; each photo queries with all its variants
-        // (orientations for images, sampled frames for videos), so a rotated
-        // or mirrored duplicate still lands within the Hamming threshold.
+        // (8 dihedral orientations), so a rotated or mirrored duplicate still
+        // lands within the Hamming threshold. Union-find is only used here to
+        // generate cheap *candidate* components from the BK-tree — membership
+        // in a component means "connected by a chain of close pairs," not
+        // "every member is close to every other member" (single-linkage), so
+        // it's refined below before becoming real clusters.
         var unionFind = UnionFind()
         let tree = BKTree()
         for entry in entries {
@@ -143,14 +206,65 @@ enum Clusterer {
             }
         }
 
-        var groups: [String: [String]] = [:]
+        var candidates: [String: [String]] = [:]
         for entry in entries {
-            groups[unionFind.find(entry.uuid), default: []].append(entry.uuid)
+            candidates[unionFind.find(entry.uuid), default: []].append(entry.uuid)
         }
+        let entryByUuid = Dictionary(uniqueKeysWithValues: entries.map { ($0.uuid, $0) })
         let confidence = max(0.0, 1.0 - Double(phashThreshold) / 64.0)
-        for group in groups.values where group.count > 1 {
-            try insertCluster(db, kind: "phash", confidence: confidence, now: now, members: group)
+        for candidate in candidates.values where candidate.count > 1 {
+            for tight in tightSubgroups(candidate, entryByUuid: entryByUuid) where tight.count > 1 {
+                proposed.append(ProposedCluster(kind: "phash", confidence: confidence, members: tight))
+            }
         }
+    }
+
+    /// Union-find candidate components are single-linkage: A↔B↔C only implies
+    /// A and C are each within one hop of a shared neighbor, not that A and C
+    /// are similar to each other. That chaining is exactly how visually
+    /// unrelated photos (each individually close to a shared low-detail
+    /// neighbor — a mostly-blank scan, a high-contrast text card) end up
+    /// welded into one "duplicate" group. This greedy pass splits each
+    /// component into maximal subgroups where every member is within
+    /// `phashThreshold` of every other member (complete-linkage), admitting
+    /// new members only when they're close to everyone already accepted.
+    private static func tightSubgroups(
+        _ uuids: [String], entryByUuid: [String: PhashEntry]
+    ) -> [[String]] {
+        var unassigned = uuids
+        var result: [[String]] = []
+        while !unassigned.isEmpty {
+            let seedUuid = unassigned.removeFirst()
+            guard let seed = entryByUuid[seedUuid] else { continue }
+            var subgroup = [seedUuid]
+            var subgroupVariants = [seed.variants]
+            var remaining: [String] = []
+            for candidateUuid in unassigned {
+                guard let candidate = entryByUuid[candidateUuid] else { continue }
+                let fitsAll = subgroupVariants.allSatisfy {
+                    minHammingDistance($0, candidate.variants) <= phashThreshold
+                }
+                if fitsAll {
+                    subgroup.append(candidateUuid)
+                    subgroupVariants.append(candidate.variants)
+                } else {
+                    remaining.append(candidateUuid)
+                }
+            }
+            result.append(subgroup)
+            unassigned = remaining
+        }
+        return result
+    }
+
+    private static func minHammingDistance(_ a: [UInt64], _ b: [UInt64]) -> Int {
+        var best = Int.max
+        for x in a {
+            for y in b {
+                best = min(best, PHash.hammingDistance(x, y))
+            }
+        }
+        return best
     }
 
     private static func parseVariants(_ joined: String?, fallback: UInt64) -> [UInt64] {
@@ -169,7 +283,7 @@ enum Clusterer {
 
     /// Four-level funnel: same filename stem → capture-time proximity →
     /// duration proximity + aspect-ratio sanity → frame-pHash visual veto.
-    private static func clusterVideos(_ db: Database, now: Double) throws {
+    private static func clusterVideos(_ db: Database, _ proposed: inout [ProposedCluster]) throws {
         let rows = try Row.fetchAll(db, sql: """
             SELECT uuid, original_filename, duration, date_taken, phash, phash_variants, width, height
             FROM photos WHERE media_type = 'video'
@@ -235,8 +349,8 @@ enum Clusterer {
                         continue
                     }
 
-                    try insertCluster(db, kind: "video", confidence: 1.0, now: now,
-                                      members: group.map(\.uuid))
+                    proposed.append(ProposedCluster(kind: "video", confidence: 1.0,
+                                      members: group.map(\.uuid)))
                 }
             }
         }

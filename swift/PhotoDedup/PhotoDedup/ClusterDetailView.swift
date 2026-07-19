@@ -9,12 +9,13 @@ struct ClusterDetailView: View {
 
     @State private var detail: ClusterDetail?
     @State private var isLoading = true
-    @State private var selectedUUIDs: Set<String> = []
-    @State private var showDeleteConfirm = false
     @State private var errorMessage: String?
-    @State private var deleteError: String?
     @State private var showLightbox = false
     @State private var lightboxIndex = 0
+    @State private var queue = DeletionQueue.shared
+    @State private var showMarkError = false
+    @State private var focusedIndex = 0
+    @FocusState private var gridFocused: Bool
 
     var body: some View {
         Group {
@@ -28,92 +29,136 @@ struct ClusterDetailView: View {
         .navigationSubtitle(detail.map { "\($0.kind.replacingOccurrences(of: "_", with: " ").capitalized) · \($0.photos.count) photos" } ?? "")
         .toolbar { toolbar }
         .task(id: clusterId) { await load() }
-        .alert("Delete Error", isPresented: .constant(deleteError != nil)) {
-            Button("OK") { deleteError = nil }
+        // Keyboard: ← → move the focused photo, Delete/Backspace marks it,
+        // Return opens it in the lightbox.
+        .focusable()
+        .focused($gridFocused)
+        .onKeyPress(.leftArrow)  { moveFocus(-1); return .handled }
+        .onKeyPress(.rightArrow) { moveFocus(1);  return .handled }
+        .onKeyPress(.delete)     { toggleFocusedMark(); return .handled }
+        .onKeyPress(.return)     { openFocused(); return .handled }
+        .onChange(of: showLightbox) { _, shown in
+            if !shown { gridFocused = true }   // reclaim key focus when lightbox closes
+        }
+        // When the batch is committed, drop the deleted rows from this grid.
+        .onChange(of: queue.commitGeneration) {
+            let removed = queue.lastCommitUUIDs
+            detail?.photos.removeAll { removed.contains($0.uuid) }
+            clampFocus()
+        }
+        .onChange(of: queue.lastError) { _, newValue in
+            showMarkError = newValue != nil
+        }
+        .alert("Can't Mark Photo", isPresented: $showMarkError) {
+            Button("OK") { queue.clearError() }
         } message: {
-            Text(deleteError ?? "")
+            Text(queue.lastError ?? "")
         }
         .sheet(isPresented: $showLightbox) {
             if let photos = detail?.photos {
-                LightboxView(
-                    photos: photos,
-                    initialIndex: lightboxIndex,
-                    onDelete: { uuid in
-                        detail?.photos.removeAll { $0.uuid == uuid }
-                        selectedUUIDs.remove(uuid)
-                    }
-                )
-                .frame(minWidth: 760, minHeight: 560)
+                LightboxView(photos: photos, initialIndex: lightboxIndex)
+                    .frame(minWidth: 760, minHeight: 560)
             }
         }
     }
 
     @ViewBuilder
     private func content(_ detail: ClusterDetail) -> some View {
-        ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 12)], spacing: 12) {
-                ForEach(detail.photos) { photo in
-                    PhotoCard(
-                        photo: photo,
-                        isSelected: selectedUUIDs.contains(photo.uuid),
-                        onToggleSelect: { toggleSelection(photo.uuid) },
-                        onDelete: { await deleteSingle(photo) },
-                        onOpen: {
-                            lightboxIndex = detail.photos.firstIndex(where: { $0.uuid == photo.uuid }) ?? 0
-                            showLightbox = true
-                        }
-                    )
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 12)], spacing: 12) {
+                    ForEach(Array(detail.photos.enumerated()), id: \.element.uuid) { index, photo in
+                        PhotoCard(
+                            photo: photo,
+                            isMarked: queue.isMarked(photo.uuid),
+                            isFocused: gridFocused && focusedIndex == index,
+                            onToggleMark: { toggleMark(photo) },
+                            onOpen: {
+                                focusedIndex = index
+                                lightboxIndex = index
+                                showLightbox = true
+                            }
+                        )
+                        .id(photo.uuid)
+                    }
+                }
+                .padding()
+            }
+            .onChange(of: focusedIndex) { _, index in
+                guard detail.photos.indices.contains(index) else { return }
+                withAnimation(.easeOut(duration: 0.15)) {
+                    proxy.scrollTo(detail.photos[index].uuid, anchor: .center)
                 }
             }
-            .padding()
         }
+    }
+
+    // MARK: - Keyboard navigation
+
+    private func moveFocus(_ delta: Int) {
+        guard let count = detail?.photos.count, count > 0 else { return }
+        focusedIndex = min(max(focusedIndex + delta, 0), count - 1)
+    }
+
+    private func toggleFocusedMark() {
+        guard let photos = detail?.photos, photos.indices.contains(focusedIndex) else { return }
+        toggleMark(photos[focusedIndex])
+    }
+
+    private func openFocused() {
+        guard let photos = detail?.photos, photos.indices.contains(focusedIndex) else { return }
+        lightboxIndex = focusedIndex
+        showLightbox = true
+    }
+
+    private func clampFocus() {
+        guard let count = detail?.photos.count, count > 0 else { focusedIndex = 0; return }
+        focusedIndex = min(focusedIndex, count - 1)
     }
 
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
         ToolbarItem(placement: .primaryAction) {
-            Button(role: .destructive) {
-                showDeleteConfirm = true
-            } label: {
-                Label("Move \(selectedUUIDs.count) to Trash", systemImage: "trash")
-            }
-            .disabled(selectedUUIDs.isEmpty)
-            .confirmationDialog(
-                "Move \(selectedUUIDs.count) photo(s) to trash?",
-                isPresented: $showDeleteConfirm,
-                titleVisibility: .visible
-            ) {
-                Button("Move to Trash", role: .destructive) {
-                    Task { await deleteSelected() }
+            if let detail, !detail.photos.isEmpty {
+                let allMarked = detail.photos.allSatisfy { queue.isMarked($0.uuid) }
+                Button {
+                    if allMarked { unmarkAll(detail) } else { markAll(detail) }
+                } label: {
+                    Label(allMarked ? "Unmark All" : "Mark All",
+                          systemImage: allMarked ? "square" : "checkmark.square")
                 }
-            } message: {
-                Text("Photos will remain in the Recently Deleted album for 30 days before permanent deletion.")
-            }
-        }
-        ToolbarItem(placement: .cancellationAction) {
-            if !selectedUUIDs.isEmpty {
-                Button("Deselect All") { selectedUUIDs.removeAll() }
             }
         }
     }
 
-    private func toggleSelection(_ uuid: String) {
-        if selectedUUIDs.contains(uuid) {
-            selectedUUIDs.remove(uuid)
+    private func toggleMark(_ photo: PhotoMeta) {
+        if queue.isMarked(photo.uuid) {
+            queue.unmark(photo.uuid)
         } else {
-            selectedUUIDs.insert(uuid)
+            queue.mark(photo)   // sets queue.lastError → alert if it can't be deleted
         }
+    }
+
+    private func markAll(_ detail: ClusterDetail) {
+        for photo in detail.photos where !queue.isMarked(photo.uuid) {
+            queue.mark(photo)
+        }
+    }
+
+    private func unmarkAll(_ detail: ClusterDetail) {
+        for photo in detail.photos { queue.unmark(photo.uuid) }
     }
 
     @MainActor
     private func load() async {
         isLoading = true
         detail = nil
-        selectedUUIDs = []
+        focusedIndex = 0
         do {
             let loaded = try await LocalBackend.shared.cluster(id: clusterId)
             detail = loaded
             isLoading = false
+            gridFocused = true
         } catch is CancellationError {
             // user navigated to another cluster; new task owns loading state
         } catch {
@@ -121,83 +166,14 @@ struct ClusterDetailView: View {
             errorMessage = error.localizedDescription
         }
     }
-
-    @MainActor
-    private func deleteSelected() async {
-        guard let detail else { return }
-        let identifiers = detail.photos
-            .filter { selectedUUIDs.contains($0.uuid) }
-            .compactMap(\.localIdentifier)
-
-        guard identifiers.count == selectedUUIDs.count else {
-            deleteError = "Some selected assets are missing full PhotoKit identifiers. Run a new scan before deleting."
-            return
-        }
-
-        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
-        var assets: [PHAsset] = []
-        fetchResult.enumerateObjects { asset, _, _ in assets.append(asset) }
-
-        guard assets.count == identifiers.count else {
-            deleteError = "Some selected assets could not be found in Photos. Nothing was moved to trash."
-            return
-        }
-        await performDelete(assets)
-    }
-
-    @MainActor
-    private func deleteSingle(_ photo: PhotoMeta) async {
-        guard let identifier = photo.localIdentifier else {
-            deleteError = "Missing PhotoKit identifier. Run a new scan before deleting."
-            return
-        }
-        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
-        var assets: [PHAsset] = []
-        fetchResult.enumerateObjects { asset, _, _ in assets.append(asset) }
-        guard !assets.isEmpty else {
-            deleteError = "Asset not found in Photos library."
-            return
-        }
-        await performDelete(assets)
-    }
-
-    @MainActor
-    private func performDelete(_ assets: [PHAsset]) async {
-        // performChanges:completionHandler: crashes with _dispatch_assert_queue_fail when
-        // the Photos daemon returns com.apple.accounts Code=7 during changes execution —
-        // the crash occurs before our completion handler is even called, so dispatching
-        // to main in the handler can't save us. performChangesAndWait throws an NSError
-        // in the same condition instead of crashing. Run it on a background thread so
-        // it doesn't block the main thread while Photos commits.
-        do {
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                DispatchQueue.global(qos: .userInitiated).async {
-                    do {
-                        try PHPhotoLibrary.shared().performChangesAndWait {
-                            PHAssetChangeRequest.deleteAssets(assets as NSArray)
-                        }
-                        DispatchQueue.main.async { cont.resume() }
-                    } catch {
-                        DispatchQueue.main.async { cont.resume(throwing: error) }
-                    }
-                }
-            }
-            selectedUUIDs.removeAll()
-            await load()
-        } catch {
-            deleteError = error.localizedDescription
-        }
-    }
 }
 
 struct PhotoCard: View {
     let photo: PhotoMeta
-    let isSelected: Bool
-    let onToggleSelect: () -> Void
-    let onDelete: () async -> Void
+    let isMarked: Bool
+    var isFocused: Bool = false
+    let onToggleMark: () -> Void
     let onOpen: () -> Void
-
-    @State private var showDeleteConfirm = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -208,10 +184,18 @@ struct PhotoCard: View {
                 .clipShape(RoundedRectangle(cornerRadius: 8))
                 .contentShape(Rectangle())
                 .onTapGesture { onOpen() }
+                .overlay(alignment: .topTrailing) {
+                    if isMarked {
+                        Image(systemName: "trash.circle.fill")
+                            .font(.title2)
+                            .foregroundStyle(.white, .red)
+                            .padding(6)
+                    }
+                }
 
             VStack(alignment: .leading, spacing: 4) {
-                // Checkbox + filename — toggles selection
-                Toggle(isOn: Binding(get: { isSelected }, set: { _ in onToggleSelect() })) {
+                // Checkbox + filename — marks the photo for batch deletion
+                Toggle(isOn: Binding(get: { isMarked }, set: { _ in onToggleMark() })) {
                     Text(photo.filename)
                         .font(AppFont.base.bold())
                         .lineLimit(1)
@@ -235,28 +219,32 @@ struct PhotoCard: View {
                 }
                 .foregroundStyle(.secondary)
 
-                Button(role: .destructive, action: { showDeleteConfirm = true }) {
-                    Label("Delete", systemImage: "trash").frame(maxWidth: .infinity)
+                Button(action: onToggleMark) {
+                    Label(isMarked ? "Marked for Deletion" : "Mark for Deletion",
+                          systemImage: isMarked ? "trash.fill" : "trash")
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.regular)
-                .tint(.red)
+                .tint(isMarked ? .red : .green)
                 .padding(.top, 2)
-                .confirmationDialog("Move to Recently Deleted?", isPresented: $showDeleteConfirm, titleVisibility: .visible) {
-                    Button("Move to Trash", role: .destructive) { Task { await onDelete() } }
-                } message: {
-                    Text("The photo stays in Recently Deleted for 30 days.")
-                }
             }
             .padding(.horizontal, 6)
             .padding(.bottom, 6)
         }
-        .background(isSelected ? Color.accentColor.opacity(0.12) : Color(.windowBackgroundColor))
+        .background(isMarked ? Color.red.opacity(0.12) : Color(.windowBackgroundColor))
         .overlay(
             RoundedRectangle(cornerRadius: 10)
-                .stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 2)
+                .stroke(isMarked ? Color.red : Color.clear, lineWidth: 2)
         )
         .clipShape(RoundedRectangle(cornerRadius: 10))
+        // Keyboard-focus ring, drawn outside the clip so it reads as a highlight
+        // distinct from the red "marked" border.
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(isFocused ? Color.accentColor : Color.clear, lineWidth: 3)
+                .padding(-3)
+        )
     }
 
     private var originDateText: String? {
@@ -380,18 +368,14 @@ struct PHAssetThumbnailView: View {
 // MARK: - Lightbox
 
 struct LightboxView: View {
-    /// Called with the deleted photo's UUID so the parent grid can remove the row.
-    let onDelete: (String) -> Void
-
     @State private var localPhotos: [PhotoMeta]
     @State private var currentIndex: Int
-    @State private var showDeleteConfirm = false
-    @State private var deleteError: String?
+    @State private var queue = DeletionQueue.shared
+    @State private var showMarkError = false
     @Environment(\.dismiss) private var dismiss
     @FocusState private var focused: Bool
 
-    init(photos: [PhotoMeta], initialIndex: Int, onDelete: @escaping (String) -> Void) {
-        self.onDelete = onDelete
+    init(photos: [PhotoMeta], initialIndex: Int) {
         _localPhotos = State(initialValue: photos)
         _currentIndex = State(initialValue: initialIndex)
     }
@@ -400,7 +384,10 @@ struct LightboxView: View {
 
     var body: some View {
         ZStack {
+            // Tapping the black backdrop (anywhere outside the photo) closes the view.
             Color.black.ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture { dismiss() }
 
             LightboxMediaView(photo: current)
                 .id(current.uuid)
@@ -442,14 +429,15 @@ struct LightboxView: View {
                     }
                     .buttonStyle(.bordered)
                     .help("Reveal this photo in the Photos app")
-                    Button(role: .destructive) {
-                        showDeleteConfirm = true
+                    Button {
+                        toggleMark()
                     } label: {
-                        Label("Delete", systemImage: "trash")
+                        Label(queue.isMarked(current.uuid) ? "Marked for Deletion" : "Mark for Deletion",
+                              systemImage: queue.isMarked(current.uuid) ? "trash.fill" : "trash")
                             .padding(.horizontal, 4)
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(.red)
+                    .tint(queue.isMarked(current.uuid) ? .red : .green)
                 }
                 .padding(.horizontal, 20)
                 .padding(.vertical, 14)
@@ -461,24 +449,15 @@ struct LightboxView: View {
         .onAppear { focused = true }
         .onKeyPress(.leftArrow)  { prev(); return .handled }
         .onKeyPress(.rightArrow) { next(); return .handled }
+        .onKeyPress(.delete)     { toggleMarkInPlace(); return .handled }
         .onKeyPress(.escape)     { dismiss(); return .handled }
-        .confirmationDialog(
-            "Move \(current.filename) to Recently Deleted?",
-            isPresented: $showDeleteConfirm,
-            titleVisibility: .visible,
-            actions: {
-                Button("Move to Trash", role: .destructive) {
-                    Task { await performLightboxDelete() }
-                }
-            },
-            message: {
-                Text("The photo stays in Recently Deleted for 30 days before permanent removal.")
-            }
-        )
-        .alert("Delete Error", isPresented: .constant(deleteError != nil)) {
-            Button("OK") { deleteError = nil }
+        .onChange(of: queue.lastError) { _, newValue in
+            showMarkError = newValue != nil
+        }
+        .alert("Can't Mark Photo", isPresented: $showMarkError) {
+            Button("OK") { queue.clearError() }
         } message: {
-            Text(deleteError ?? "")
+            Text(queue.lastError ?? "")
         }
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
@@ -492,81 +471,68 @@ struct LightboxView: View {
 
     /// Bring the current photo into focus inside the macOS Photos app.
     ///
-    /// Strategy: run a brief AppleScript that tells Photos to `spotlight` the
-    /// item using its internal UUID (the leading segment of the PHAsset
-    /// localIdentifier before the first `/`).  If AppleScript fails for any
-    /// reason — Photos not installed, sandboxing, older OS — we fall back to
-    /// simply activating Photos so the user at least lands in the right app.
+    /// The Photos AppleScript `media item id` is NOT reliably the bare UUID:
+    /// depending on macOS version it is the full PHAsset localIdentifier
+    /// ("UUID/L0/001") or just the UUID. The previous code always stripped to
+    /// the UUID, so on systems that key on the full identifier `spotlight` found
+    /// no match and silently revealed the wrong (last-viewed) photo. We now try
+    /// the full identifier first and fall back to the UUID inside the script, so
+    /// whichever form Photos expects, the correct photo is revealed. If both
+    /// fail we just activate Photos.
     private func openInPhotos() {
-        // PHAsset localIdentifier looks like "UUID/L0/001". Photos AppleScript
-        // uses just the UUID portion as the media item id.
-        let photosId = current.localIdentifier?
-            .components(separatedBy: "/").first ?? ""
-
-        let script: String
-        if photosId.isEmpty {
-            script = #"tell application "Photos" to activate"#
-        } else {
-            script = """
-            tell application "Photos"
-                activate
-                spotlight (media item id "\(photosId)")
-            end tell
-            """
+        guard let fullId = current.localIdentifier, !fullId.isEmpty else {
+            activatePhotos()
+            return
         }
+        let uuid = fullId.components(separatedBy: "/").first ?? fullId
+        let escapedFull = fullId.replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedUUID = uuid.replacingOccurrences(of: "\"", with: "\\\"")
+
+        let script = """
+        tell application "Photos"
+            activate
+            try
+                spotlight (media item id "\(escapedFull)")
+            on error
+                spotlight (media item id "\(escapedUUID)")
+            end try
+        end tell
+        """
 
         var errorDict: NSDictionary?
         if let appleScript = NSAppleScript(source: script) {
             appleScript.executeAndReturnError(&errorDict)
         }
         if errorDict != nil {
-            // AppleScript failed (sandboxing, Photos absent, etc.) — open Photos directly.
-            if let photosURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Photos") {
-                NSWorkspace.shared.open(photosURL)
-            }
+            activatePhotos()
         }
     }
 
-    @MainActor
-    private func performLightboxDelete() async {
-        let photo = localPhotos[currentIndex]
-        guard let identifier = photo.localIdentifier else {
-            deleteError = "Missing PhotoKit identifier. Run a new scan before deleting."
-            return
+    private func activatePhotos() {
+        if let photosURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Photos") {
+            NSWorkspace.shared.open(photosURL)
         }
-        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
-        var assets: [PHAsset] = []
-        fetchResult.enumerateObjects { asset, _, _ in assets.append(asset) }
-        guard !assets.isEmpty else {
-            deleteError = "Asset not found in Photos library."
-            return
+    }
+
+    /// Marks (or unmarks) the current photo for batch deletion. Marking is
+    /// reversible and never deletes here — the actual removal happens when the
+    /// user commits from the app-wide bar. After marking, advance to the next
+    /// photo so rapid review flows naturally; unmarking stays put.
+    private func toggleMark() {
+        if queue.isMarked(current.uuid) {
+            queue.unmark(current.uuid)
+        } else if queue.mark(current) {
+            if currentIndex < localPhotos.count - 1 { next() }
         }
+    }
 
-        do {
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                DispatchQueue.global(qos: .userInitiated).async {
-                    do {
-                        try PHPhotoLibrary.shared().performChangesAndWait {
-                            PHAssetChangeRequest.deleteAssets(assets as NSArray)
-                        }
-                        DispatchQueue.main.async { cont.resume() }
-                    } catch {
-                        DispatchQueue.main.async { cont.resume(throwing: error) }
-                    }
-                }
-            }
-
-            let deletedUUID = photo.uuid
-            onDelete(deletedUUID)                   // remove from parent grid
-            localPhotos.remove(at: currentIndex)    // remove from lightbox list
-
-            if localPhotos.isEmpty {
-                dismiss()
-            } else if currentIndex >= localPhotos.count {
-                currentIndex = localPhotos.count - 1 // was last item; step back
-            }
-        } catch {
-            deleteError = error.localizedDescription
+    /// Backspace handler: pure toggle of the current photo's marked state, with
+    /// no auto-advance (unlike the Mark button, which advances for fast review).
+    private func toggleMarkInPlace() {
+        if queue.isMarked(current.uuid) {
+            queue.unmark(current.uuid)
+        } else {
+            queue.mark(current)
         }
     }
 
@@ -596,8 +562,16 @@ struct LightboxMediaView: View {
     }
 
     var body: some View {
-        if isVideo { LightboxVideoView(photo: photo) }
-        else        { LightboxImageView(photo: photo) }
+        if isVideo {
+            LightboxVideoView(photo: photo)
+        } else {
+            // The image is letterboxed inside a full-size frame, so its
+            // transparent margins would otherwise swallow "tap outside to
+            // dismiss". Disable hit testing so those taps fall through to the
+            // backdrop's dismiss gesture (a still image needs no interaction).
+            LightboxImageView(photo: photo)
+                .allowsHitTesting(false)
+        }
     }
 }
 

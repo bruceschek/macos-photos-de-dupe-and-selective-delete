@@ -20,6 +20,8 @@
 		9A48929BA6DB1BF9A9B879EC /* PHash.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F72E84B6104B1F0E0BC393B /* PHash.swift */; };
 		B59059EFFCAE2EE973F687EA /* Clusterer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D13F629F055AF42ADD1B332 /* Clusterer.swift */; };
 		C815898A3A149DF52D03C15A /* AssetHasher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 87CED097038735C3BFE32BC1 /* AssetHasher.swift */; };
+		DE1E7E00000000000000B001 /* DeletionQueue.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE1E7E00000000000000F001 /* DeletionQueue.swift */; };
+		DE1E7E00000000000000B002 /* ImageClassifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE1E7E00000000000000F002 /* ImageClassifier.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -37,6 +39,8 @@
 		9F72E84B6104B1F0E0BC393B /* PHash.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PHash.swift; sourceTree = "<group>"; };
 		3D13F629F055AF42ADD1B332 /* Clusterer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Clusterer.swift; sourceTree = "<group>"; };
 		87CED097038735C3BFE32BC1 /* AssetHasher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AssetHasher.swift; sourceTree = "<group>"; };
+		DE1E7E00000000000000F001 /* DeletionQueue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeletionQueue.swift; sourceTree = "<group>"; };
+		DE1E7E00000000000000F002 /* ImageClassifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageClassifier.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -82,6 +86,8 @@
 				9F72E84B6104B1F0E0BC393B /* PHash.swift */,
 				3D13F629F055AF42ADD1B332 /* Clusterer.swift */,
 				87CED097038735C3BFE32BC1 /* AssetHasher.swift */,
+				DE1E7E00000000000000F001 /* DeletionQueue.swift */,
+				DE1E7E00000000000000F002 /* ImageClassifier.swift */,
 				DA2B3C4D5E6F708192A3B450 /* PhotoDedup.entitlements */,
 			);
 			path = PhotoDedup;
@@ -173,6 +179,8 @@
 				9A48929BA6DB1BF9A9B879EC /* PHash.swift in Sources */,
 				B59059EFFCAE2EE973F687EA /* Clusterer.swift in Sources */,
 				C815898A3A149DF52D03C15A /* AssetHasher.swift in Sources */,
+				DE1E7E00000000000000B001 /* DeletionQueue.swift in Sources */,
+				DE1E7E00000000000000B002 /* ImageClassifier.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
