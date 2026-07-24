@@ -25,6 +25,22 @@ enum Clusterer {
     // 1.20 lets 5:4 vs 4:3 pass; landscape vs portrait fails immediately.
     private static let videoAspectRatioMaxRatio = 1.20
 
+    // MARK: Study Blocks
+    // A "study block" is a long, time-continuous run of similar photos surfaced
+    // for human culling (not an auto-actionable duplicate group). Detection is
+    // deliberately looser than the duplicate passes: it groups by capture-time
+    // contiguity first, then requires only broad visual continuity.
+    //
+    // Cut a new block when the gap between consecutive frames exceeds this.
+    private static let studyBlockGapSeconds = 300.0        // 5 min
+    // Looser than the photo duplicate threshold (4) — continuity, not identity.
+    private static let studyBlockLooseThreshold = 12
+    // Fraction of time-adjacent pairs that must be visually continuous, so a
+    // rapid but unrelated run (e.g. a batch of screenshots) is rejected.
+    private static let studyBlockContinuityFraction = 0.5
+    // Substance floor; long runs dominate because they sort by member count.
+    private static let studyBlockMinSize = 5
+
     /// One candidate group, not yet written to the DB. Collecting all passes'
     /// output before touching `clusters` lets `buildClusters` diff against what
     /// is already there instead of blindly delete-and-reinsert.
@@ -32,6 +48,9 @@ enum Clusterer {
         let kind: String
         let confidence: Double
         let members: [String]
+        // Study-block-only; nil for the duplicate kinds.
+        var timeSpanSeconds: Double? = nil
+        var estimatedRedundant: Int? = nil
     }
 
     /// Rebuilds clusters, preserving the row (and id) of any cluster whose kind
@@ -41,13 +60,19 @@ enum Clusterer {
     /// autoincrement id, and the sidebar/detail selection would jump around
     /// under the user mid-scan even though most groups aren't actually
     /// changing. Returns the final cluster count.
-    static func buildClusters(_ db: Database) throws -> Int {
+    /// `includeStudyBlocks` gates the timeline-scanning study-block pass to the
+    /// authoritative final rebuild — it needs the whole capture timeline, so
+    /// running it on the every-few-seconds live pass would be premature.
+    static func buildClusters(_ db: Database, includeStudyBlocks: Bool = false) throws -> Int {
         var proposed: [ProposedCluster] = []
         try clusterBursts(db, &proposed)
         try clusterRawJpeg(db, &proposed)
         try clusterLivePhotos(db, &proposed)
         try clusterPhash(db, &proposed)
         try clusterVideos(db, &proposed)
+        if includeStudyBlocks {
+            try clusterStudyBlocks(db, &proposed)
+        }
 
         let existing = try Row.fetchAll(db, sql: """
             SELECT c.id, c.kind, GROUP_CONCAT(cm.photo_uuid) as members
@@ -71,7 +96,9 @@ enum Clusterer {
                 keptIds.insert(existingId)   // unchanged — leave row (and caption) alone
             } else {
                 try insertCluster(db, kind: cluster.kind, confidence: cluster.confidence,
-                                  now: now, members: cluster.members)
+                                  now: now, members: cluster.members,
+                                  timeSpanSeconds: cluster.timeSpanSeconds,
+                                  estimatedRedundant: cluster.estimatedRedundant)
             }
         }
 
@@ -211,12 +238,32 @@ enum Clusterer {
             candidates[unionFind.find(entry.uuid), default: []].append(entry.uuid)
         }
         let entryByUuid = Dictionary(uniqueKeysWithValues: entries.map { ($0.uuid, $0) })
-        let confidence = max(0.0, 1.0 - Double(phashThreshold) / 64.0)
         for candidate in candidates.values where candidate.count > 1 {
             for tight in tightSubgroups(candidate, entryByUuid: entryByUuid) where tight.count > 1 {
+                let confidence = groupConfidence(tight, entryByUuid: entryByUuid)
                 proposed.append(ProposedCluster(kind: "phash", confidence: confidence, members: tight))
             }
         }
+    }
+
+    /// Confidence reflects how similar THIS group's members actually are, not
+    /// just that they cleared the threshold. Previously every phash cluster
+    /// showed the same constant 93% (derived from the threshold itself), so a
+    /// pixel-identical pair and a borderline pair right at the matching edge
+    /// were indistinguishable in the UI — exactly the groups worth flagging as
+    /// "maybe not a real duplicate" looked as trustworthy as the obvious ones.
+    /// Uses the worst (most-different) pair in the group, so confidence only
+    /// drops when some pair is genuinely close to the threshold.
+    private static func groupConfidence(_ uuids: [String], entryByUuid: [String: PhashEntry]) -> Double {
+        var maxDistance = 0
+        for i in uuids.indices {
+            guard let a = entryByUuid[uuids[i]] else { continue }
+            for j in uuids.indices where j > i {
+                guard let b = entryByUuid[uuids[j]] else { continue }
+                maxDistance = max(maxDistance, minHammingDistance(a.variants, b.variants))
+            }
+        }
+        return max(0.0, 1.0 - Double(maxDistance) / 64.0)
     }
 
     /// Union-find candidate components are single-linkage: A↔B↔C only implies
@@ -356,14 +403,104 @@ enum Clusterer {
         }
     }
 
+    // MARK: - Study blocks
+
+    private struct BlockEntry {
+        let uuid: String
+        let dateTaken: Double
+        let variants: [UInt64]
+    }
+
+    /// Finds long, time-continuous runs of similar photos worth human review.
+    /// Three gates: (1) gap-based temporal segmentation over the whole timeline,
+    /// (2) a visual-continuity fraction so unrelated rapid runs are rejected,
+    /// (3) a size floor. Each surviving block also carries a rough count of how
+    /// many members are near-identical to an earlier frame — the cull estimate.
+    private static func clusterStudyBlocks(_ db: Database, _ proposed: inout [ProposedCluster]) throws {
+        let rows = try Row.fetchAll(db, sql: """
+            SELECT uuid, date_taken, phash, phash_variants FROM photos
+            WHERE phash IS NOT NULL AND media_type != 'video' AND date_taken IS NOT NULL
+            """)
+
+        var entries: [BlockEntry] = []
+        for row in rows {
+            let hex: String = row["phash"]
+            guard let primary = UInt64(hex, radix: 16) else { continue }
+            // Same degenerate-hash guard as the phash pass: near-uniform frames
+            // would glue an incoherent block together.
+            let bitCount = primary.nonzeroBitCount
+            if bitCount <= phashMinBits || bitCount >= phashMaxBits { continue }
+            let variants = parseVariants(row["phash_variants"], fallback: primary)
+            entries.append(BlockEntry(uuid: row["uuid"], dateTaken: row["date_taken"] ?? 0,
+                                      variants: variants))
+        }
+        guard entries.count >= studyBlockMinSize else { return }
+        entries.sort { $0.dateTaken < $1.dateTaken }
+
+        // Gap-based (chained) segmentation: a new block starts whenever the gap to
+        // the previous frame exceeds the threshold. Unlike the anchor-based
+        // `timeGroups`, a block can span far longer than one gap.
+        var segment: [BlockEntry] = []
+        func flush() {
+            defer { segment = [] }
+            guard segment.count >= studyBlockMinSize,
+                  let block = qualifyBlock(segment) else { return }
+            proposed.append(block)
+        }
+        for entry in entries {
+            if let last = segment.last, entry.dateTaken - last.dateTaken > studyBlockGapSeconds {
+                flush()
+            }
+            segment.append(entry)
+        }
+        flush()
+    }
+
+    /// Applies the visual-continuity gate and, if it passes, builds the block's
+    /// ProposedCluster with span and cull-estimate metadata.
+    private static func qualifyBlock(_ segment: [BlockEntry]) -> ProposedCluster? {
+        var continuousPairs = 0
+        for i in 1..<segment.count
+        where minHammingDistance(segment[i - 1].variants, segment[i].variants) <= studyBlockLooseThreshold {
+            continuousPairs += 1
+        }
+        let fraction = Double(continuousPairs) / Double(segment.count - 1)
+        guard fraction >= studyBlockContinuityFraction else { return nil }
+
+        let span = segment.last!.dateTaken - segment.first!.dateTaken
+        return ProposedCluster(
+            kind: "study_block",
+            confidence: fraction,
+            members: segment.map(\.uuid),
+            timeSpanSeconds: span,
+            estimatedRedundant: estimateRedundant(segment))
+    }
+
+    /// Counts members that are near-identical (within the tight photo threshold)
+    /// to some earlier frame in the run — an estimate of how many could be culled.
+    private static func estimateRedundant(_ segment: [BlockEntry]) -> Int {
+        var redundant = 0
+        for i in segment.indices {
+            for j in 0..<i where minHammingDistance(segment[j].variants, segment[i].variants) <= phashThreshold {
+                redundant += 1
+                break
+            }
+        }
+        return redundant
+    }
+
     // MARK: - Helpers
 
     private static func insertCluster(
-        _ db: Database, kind: String, confidence: Double, now: Double, members: [String]
+        _ db: Database, kind: String, confidence: Double, now: Double, members: [String],
+        timeSpanSeconds: Double? = nil, estimatedRedundant: Int? = nil
     ) throws {
         try db.execute(
-            sql: "INSERT INTO clusters (kind, confidence, created_at) VALUES (?, ?, ?)",
-            arguments: [kind, confidence, now])
+            sql: """
+                INSERT INTO clusters (kind, confidence, created_at, time_span_seconds, estimated_redundant)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+            arguments: [kind, confidence, now, timeSpanSeconds, estimatedRedundant])
         let clusterId = db.lastInsertedRowID
         for uuid in members {
             try db.execute(sql: "INSERT INTO cluster_members VALUES (?, ?)",

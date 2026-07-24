@@ -15,7 +15,6 @@ struct PhotoRecord: Encodable {
     let width: Int
     let height: Int
     let isLocal: Bool
-    let filePath: String?
     let mediaType: String   // "image" | "video"
     let duration: Double?   // seconds, videos only
 
@@ -28,7 +27,6 @@ struct PhotoRecord: Encodable {
         case isRaw            = "is_raw"
         case isLive           = "is_live"
         case isLocal          = "is_local"
-        case filePath         = "file_path"
         case mediaType        = "media_type"
     }
 }
@@ -61,9 +59,6 @@ final class PhotoLibraryBridge {
             throw BridgeError.notAuthorized(finalStatus)
         }
 
-        let libraryURL = Self.findPhotosLibraryURL()
-        print("[Bridge] Library: \(libraryURL.path)")
-
         // Fetch images and videos separately
         let fetchOptions = PHFetchOptions()
         fetchOptions.includeHiddenAssets = false
@@ -75,10 +70,8 @@ final class PhotoLibraryBridge {
         // Ingest all metadata in batches (background thread for PHAssetResource).
         // No pre-download pass: hashing pulls thumbnails straight from
         // PhotoKit, which covers iCloud-only assets on demand.
-        try await ingestFetchResult(
-            imageResult, libraryURL: libraryURL, total: total, offset: 0)
-        try await ingestFetchResult(
-            videoResult, libraryURL: libraryURL, total: total, offset: imageResult.count)
+        try await ingestFetchResult(imageResult, total: total, offset: 0)
+        try await ingestFetchResult(videoResult, total: total, offset: imageResult.count)
 
         print("[Bridge] All ingestion done. Starting hashing.")
         try await LocalBackend.shared.startHashing()
@@ -89,7 +82,6 @@ final class PhotoLibraryBridge {
 
     private func ingestFetchResult(
         _ result: PHFetchResult<PHAsset>,
-        libraryURL: URL,
         total: Int,
         offset: Int
     ) async throws {
@@ -100,11 +92,10 @@ final class PhotoLibraryBridge {
         while cursor < count {
             let end = min(cursor + batchSize, count)
             let assets = (cursor..<end).map { result.object(at: $0) }
-            let libURL = libraryURL
 
             let records: [PhotoRecord] = await withCheckedContinuation { cont in
                 DispatchQueue.global(qos: .userInitiated).async {
-                    cont.resume(returning: assets.map { Self.makeRecord(asset: $0, libraryURL: libURL) })
+                    cont.resume(returning: assets.map { Self.makeRecord(asset: $0) })
                 }
             }
 
@@ -114,7 +105,7 @@ final class PhotoLibraryBridge {
         }
     }
 
-    private nonisolated static func makeRecord(asset: PHAsset, libraryURL: URL) -> PhotoRecord {
+    private nonisolated static func makeRecord(asset: PHAsset) -> PhotoRecord {
         let localIdentifier = asset.localIdentifier
         let uuid = asset.localIdentifier.components(separatedBy: "/").first
             ?? asset.localIdentifier
@@ -140,14 +131,6 @@ final class PhotoLibraryBridge {
         let rawExtensions: Set<String> = ["raw","cr2","cr3","nef","arw","dng","raf","orf","rw2","rw1"]
         let isRaw = !isVideo && rawExtensions.contains(ext)
 
-        let firstChar = String(uuid.prefix(1)).lowercased()
-        let candidatePath = libraryURL
-            .appendingPathComponent("originals")
-            .appendingPathComponent(firstChar)
-            .appendingPathComponent("\(uuid).\(ext)")
-            .path
-        let isLocal = FileManager.default.fileExists(atPath: candidatePath)
-
         return PhotoRecord(
             uuid: uuid,
             localIdentifier: localIdentifier,
@@ -159,22 +142,17 @@ final class PhotoLibraryBridge {
             isLive: !isVideo && asset.mediaSubtypes.contains(.photoLive),
             width: asset.pixelWidth,
             height: asset.pixelHeight,
-            isLocal: isLocal,
-            filePath: isLocal ? candidatePath : nil,
+            // Optimistic until hashing reports otherwise. Determining this at
+            // ingest used to mean stat'ing a *guessed* path inside the Photos
+            // library package (`originals/<c>/<uuid>.<ext>`) once per asset —
+            // hundreds of thousands of filesystem probes into a package no
+            // supported API says we may touch, and a guess that silently breaks
+            // whenever Apple changes the on-disk layout. `AssetHasher` now
+            // reports locality from signals the hashing pass already pays for.
+            isLocal: true,
             mediaType: isVideo ? "video" : "image",
             duration: isVideo ? asset.duration : nil
         )
-    }
-
-    private static func findPhotosLibraryURL() -> URL {
-        let prefsPath = "\(NSHomeDirectory())/Library/Preferences/com.apple.iApps.plist"
-        if let prefs = NSDictionary(contentsOfFile: prefsPath),
-           let dbs = prefs["iPhotoRecentDatabases"] as? [String],
-           let first = dbs.first {
-            if let url = URL(string: first) { return url }
-            return URL(fileURLWithPath: first)
-        }
-        return URL(fileURLWithPath: "\(NSHomeDirectory())/Pictures/Photos Library.photoslibrary")
     }
 }
 

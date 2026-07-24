@@ -273,7 +273,7 @@ struct PHAssetThumbnailView: View {
                     .resizable()
                     .aspectRatio(contentMode: .fill)
             } else {
-                let isCloudVideo = photo.filePath == nil && photo.filename.lowercased().hasSuffix(".mov")
+                let isCloudVideo = !photo.isLocal && photo.filename.lowercased().hasSuffix(".mov")
                 Color.secondary.opacity(0.08)
                     .overlay(
                         Image(systemName: isCloudVideo ? "icloud.and.arrow.down" : "photo")
@@ -324,32 +324,48 @@ struct PHAssetThumbnailView: View {
         }
     }
 
-    // requestAVAsset crashes with _dispatch_assert_queue_fail inside the Photos XPC
-    // layer (same root cause as the performChanges crash — iCloud account access).
-    // Bypass it entirely: use the file path the DB already recorded for local videos.
-    // Cloud-only videos (filePath == nil) show a video-camera placeholder.
+    /// Video poster frame, sourced through PhotoKit.
+    ///
+    /// This used to open an `AVURLAsset` on a path *inside* the Photos library
+    /// package, to route around a `_dispatch_assert_queue_fail` crash in
+    /// `requestAVAsset`. That workaround is no longer needed: `AssetHasher`
+    /// drives the same call across the whole library with
+    /// `isNetworkAccessAllowed = false`, and it is the network-enabled path
+    /// that was implicated in the crash. Going back through PhotoKit means the
+    /// app never holds an open file handle inside the package, and never
+    /// depends on Apple's private on-disk layout.
     private func loadVideoFrame(asset: PHAsset) {
-        guard let path = photo.filePath else {
-            print("[Thumbnail] No local file path for video \(photo.uuid); skipping")
-            return
-        }
-        let url = URL(fileURLWithPath: path)
-        let avAsset = AVURLAsset(url: url)
-        let gen = AVAssetImageGenerator(asset: avAsset)
-        gen.appliesPreferredTrackTransform = true
-        gen.maximumSize = CGSize(width: 600, height: 600)
-        generation = gen
+        let options = PHVideoRequestOptions()
+        options.isNetworkAccessAllowed = false   // never pull originals for a thumbnail
+        options.deliveryMode = .fastFormat
 
-        gen.generateCGImagesAsynchronously(forTimes: [NSValue(time: .zero)]) { _, cg, _, result, error in
-            if let error {
-                print("[Thumbnail] Video frame error for \(photo.uuid): \(error)")
+        PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { avAsset, _, _ in
+            guard let avAsset else {
+                // Cloud-only or unreadable: fall back to Photos' cached poster.
+                DispatchQueue.main.async {
+                    guard isActive else { return }
+                    loadPhotoThumbnail(asset: asset)
+                }
                 return
             }
-            guard result == .succeeded, let cg else { return }
+            let gen = AVAssetImageGenerator(asset: avAsset)
+            gen.appliesPreferredTrackTransform = true
+            gen.maximumSize = CGSize(width: 600, height: 600)
             DispatchQueue.main.async {
                 guard isActive else { return }
-                image = NSImage(cgImage: cg, size: .zero)
-                generation = nil
+                generation = gen
+            }
+            gen.generateCGImagesAsynchronously(forTimes: [NSValue(time: .zero)]) { _, cg, _, result, error in
+                if let error {
+                    print("[Thumbnail] Video frame error for \(photo.uuid): \(error)")
+                    return
+                }
+                guard result == .succeeded, let cg else { return }
+                DispatchQueue.main.async {
+                    guard isActive else { return }
+                    image = NSImage(cgImage: cg, size: .zero)
+                    generation = nil
+                }
             }
         }
     }
@@ -374,6 +390,9 @@ struct LightboxView: View {
     @State private var showMarkError = false
     @Environment(\.dismiss) private var dismiss
     @FocusState private var focused: Bool
+    // Tapping the photo hides the chrome (info bar + arrows) and shows it
+    // edge-to-edge; tapping again restores. Tapping the backdrop still closes.
+    @State private var fullScreen = false
 
     init(photos: [PhotoMeta], initialIndex: Int) {
         _localPhotos = State(initialValue: photos)
@@ -389,59 +408,61 @@ struct LightboxView: View {
                 .contentShape(Rectangle())
                 .onTapGesture { dismiss() }
 
-            LightboxMediaView(photo: current)
+            LightboxMediaView(photo: current, onImageTap: { fullScreen.toggle() })
                 .id(current.uuid)
+                .padding(.bottom, fullScreen ? 0 : 72)
+
+            // Prev / Next arrows and the bottom info + delete bar — both hidden
+            // while the photo is shown full-screen.
+            if !fullScreen {
+                HStack {
+                    arrowButton("chevron.left.circle.fill", action: prev)
+                        .disabled(currentIndex == 0)
+                    Spacer()
+                    arrowButton("chevron.right.circle.fill", action: next)
+                        .disabled(currentIndex == localPhotos.count - 1)
+                }
+                .padding(.horizontal, 12)
                 .padding(.bottom, 72)
 
-            // Prev / Next arrows
-            HStack {
-                arrowButton("chevron.left.circle.fill", action: prev)
-                    .disabled(currentIndex == 0)
-                Spacer()
-                arrowButton("chevron.right.circle.fill", action: next)
-                    .disabled(currentIndex == localPhotos.count - 1)
-            }
-            .padding(.horizontal, 12)
-            .padding(.bottom, 72)
-
-            // Bottom info + delete bar
-            VStack {
-                Spacer()
-                HStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(current.filename).font(.headline).foregroundStyle(.white)
-                        HStack(spacing: 8) {
-                            if let ts = current.dateTaken {
-                                Text(formattedDate(ts)).font(AppFont.base).foregroundStyle(.white.opacity(0.65))
-                            }
-                            if let w = current.width, let h = current.height {
-                                Text("\(w)×\(h)").font(AppFont.base).foregroundStyle(.white.opacity(0.65))
+                VStack {
+                    Spacer()
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(current.filename).font(.headline).foregroundStyle(.white)
+                            HStack(spacing: 8) {
+                                if let ts = current.dateTaken {
+                                    Text(formattedDate(ts)).font(AppFont.base).foregroundStyle(.white.opacity(0.65))
+                                }
+                                if let w = current.width, let h = current.height {
+                                    Text("\(w)×\(h)").font(AppFont.base).foregroundStyle(.white.opacity(0.65))
+                                }
                             }
                         }
+                        Spacer()
+                        Text("\(currentIndex + 1) / \(localPhotos.count)")
+                            .font(AppFont.label.monospacedDigit()).foregroundStyle(.white.opacity(0.65))
+                        Button(action: openInPhotos) {
+                            Label("Open in Photos", systemImage: "arrow.up.forward.app")
+                                .padding(.horizontal, 4)
+                                .foregroundStyle(.white)
+                        }
+                        .buttonStyle(.bordered)
+                        .help("Reveal this photo in the Photos app")
+                        Button {
+                            toggleMark()
+                        } label: {
+                            Label(queue.isMarked(current.uuid) ? "Marked for Deletion" : "Mark for Deletion",
+                                  systemImage: queue.isMarked(current.uuid) ? "trash.fill" : "trash")
+                                .padding(.horizontal, 4)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(queue.isMarked(current.uuid) ? .red : .green)
                     }
-                    Spacer()
-                    Text("\(currentIndex + 1) / \(localPhotos.count)")
-                        .font(AppFont.label.monospacedDigit()).foregroundStyle(.white.opacity(0.65))
-                    Button(action: openInPhotos) {
-                        Label("Open in Photos", systemImage: "arrow.up.forward.app")
-                            .padding(.horizontal, 4)
-                            .foregroundStyle(.white)
-                    }
-                    .buttonStyle(.bordered)
-                    .help("Reveal this photo in the Photos app")
-                    Button {
-                        toggleMark()
-                    } label: {
-                        Label(queue.isMarked(current.uuid) ? "Marked for Deletion" : "Mark for Deletion",
-                              systemImage: queue.isMarked(current.uuid) ? "trash.fill" : "trash")
-                            .padding(.horizontal, 4)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(queue.isMarked(current.uuid) ? .red : .green)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 14)
+                    .background(.ultraThinMaterial)
                 }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 14)
-                .background(.ultraThinMaterial)
             }
         }
         .focusable()
@@ -556,6 +577,7 @@ struct LightboxView: View {
 
 struct LightboxMediaView: View {
     let photo: PhotoMeta
+    var onImageTap: () -> Void = {}
 
     private var isVideo: Bool {
         ["mov", "mp4", "m4v"].contains((photo.filename as NSString).pathExtension.lowercased())
@@ -565,31 +587,52 @@ struct LightboxMediaView: View {
         if isVideo {
             LightboxVideoView(photo: photo)
         } else {
-            // The image is letterboxed inside a full-size frame, so its
-            // transparent margins would otherwise swallow "tap outside to
-            // dismiss". Disable hit testing so those taps fall through to the
-            // backdrop's dismiss gesture (a still image needs no interaction).
-            LightboxImageView(photo: photo)
-                .allowsHitTesting(false)
+            LightboxImageView(photo: photo, onImageTap: onImageTap)
         }
     }
 }
 
 struct LightboxImageView: View {
     let photo: PhotoMeta
+    var onImageTap: () -> Void = {}
     @State private var image: NSImage?
     @State private var requestID: PHImageRequestID?
 
     var body: some View {
-        Group {
-            if let img = image {
-                Image(nsImage: img).resizable().aspectRatio(contentMode: .fit)
-            } else {
-                ProgressView().tint(.white)
+        GeometryReader { geo in
+            ZStack {
+                if let img = image {
+                    // The image is letterboxed inside a full-size frame; disable
+                    // hit testing on it so taps on its transparent margins fall
+                    // through to the backdrop's dismiss gesture. A clear overlay
+                    // sized to the *rendered* image handles taps on the photo
+                    // itself (toggle full-screen), so margins still close.
+                    Image(nsImage: img)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .allowsHitTesting(false)
+                    let fitted = fittedSize(img.size, in: geo.size)
+                    Color.clear
+                        .frame(width: fitted.width, height: fitted.height)
+                        .contentShape(Rectangle())
+                        .onTapGesture { onImageTap() }
+                } else {
+                    ProgressView().tint(.white)
+                }
             }
+            .frame(width: geo.size.width, height: geo.size.height)
         }
         .onAppear { load() }
         .onDisappear { if let id = requestID { PHImageManager.default().cancelImageRequest(id) } }
+    }
+
+    /// Size the photo is actually drawn at when aspect-fit inside `bounds`, so a
+    /// tap target can be pinned to the visible image rather than its full frame.
+    private func fittedSize(_ imageSize: CGSize, in bounds: CGSize) -> CGSize {
+        guard imageSize.width > 0, imageSize.height > 0,
+              bounds.width > 0, bounds.height > 0 else { return bounds }
+        let scale = min(bounds.width / imageSize.width, bounds.height / imageSize.height)
+        return CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
     }
 
     private func load() {
@@ -628,13 +671,31 @@ struct LightboxVideoView: View {
                 }
             }
         }
-        .onAppear {
-            guard let path = photo.filePath else { return }
-            let p = AVPlayer(url: URL(fileURLWithPath: path))
-            player = p
-            p.play()
-        }
+        .onAppear { load() }
         .onDisappear { player?.pause(); player = nil }
+    }
+
+    /// Plays via PhotoKit's `AVPlayerItem` rather than an `AVPlayer(url:)`
+    /// pointed inside the Photos library package — same reasoning as the
+    /// poster-frame path. Network access stays enabled here because playback
+    /// is an explicit user action on one video, not a bulk background pass.
+    private func load() {
+        let identifier = photo.localIdentifier ?? "\(photo.uuid)/L0/001"
+        let result = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
+        guard let asset = result.firstObject else { return }
+        let options = PHVideoRequestOptions()
+        options.isNetworkAccessAllowed = true
+        options.deliveryMode = .automatic
+        PHImageManager.default().requestPlayerItem(
+            forVideo: asset, options: options
+        ) { item, _ in
+            guard let item else { return }
+            DispatchQueue.main.async {
+                let p = AVPlayer(playerItem: item)
+                player = p
+                p.play()
+            }
+        }
     }
 }
 

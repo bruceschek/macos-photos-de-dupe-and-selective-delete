@@ -180,6 +180,9 @@ struct ClusterListView: View {
             try await LocalBackend.shared.beginScan()
             clusters = []
             selectedCluster = nil
+            // beginScan wipes photos/clusters from the DB; any marks left over
+            // from a previous session now point at rows that no longer exist.
+            DeletionQueue.shared.clear()
 
             startPolling()
 
@@ -304,9 +307,15 @@ struct ClusterRow: View {
                 fallbackUuid: cluster.representativeUuid
             )
             VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(AppFont.label)
-                Text("\(cluster.memberCount) photos")
+                HStack(spacing: 4) {
+                    if cluster.kind == "study_block" {
+                        Image(systemName: "rectangle.stack")
+                            .font(AppFont.base).foregroundStyle(.secondary)
+                    }
+                    Text(title)
+                        .font(AppFont.label)
+                }
+                Text(subtitle)
                     .font(AppFont.base).foregroundStyle(.secondary)
             }
             Spacer()
@@ -332,8 +341,28 @@ struct ClusterRow: View {
         case "live": "Live Photo"
         case "phash": "Similar Photos"
         case "video": "Similar Videos"
+        case "study_block": "Study Block"
         default: cluster.kind.replacingOccurrences(of: "_", with: " ").capitalized
         }
+    }
+
+    // Study blocks earn a richer subtitle — capture span and a rough cull count —
+    // since their whole point is "here's a long run worth reviewing."
+    private var subtitle: String {
+        guard cluster.kind == "study_block" else { return "\(cluster.memberCount) photos" }
+        var parts = ["\(cluster.memberCount) photos"]
+        if let span = cluster.timeSpanSeconds { parts.append(Self.formatSpan(span)) }
+        if let redundant = cluster.estimatedRedundant, redundant > 0 {
+            parts.append("~\(redundant) to cull")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private static func formatSpan(_ seconds: Double) -> String {
+        let s = Int(seconds.rounded())
+        if s >= 3600 { return "\(s / 3600)h \((s % 3600) / 60)m" }
+        if s >= 60 { return "\(s / 60)m" }
+        return "\(s)s"
     }
 }
 

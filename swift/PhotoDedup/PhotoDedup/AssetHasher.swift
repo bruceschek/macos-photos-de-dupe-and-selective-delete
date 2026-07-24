@@ -19,19 +19,40 @@ final class AssetHasher: @unchecked Sendable {
         let uuid: String
         let primary: String?
         let variants: [String]   // primary first; orientations for images, frames for videos
+        /// Whether the asset's original appears to live on this Mac.
+        ///
+        /// Derived only from signals this pass already pays for — never from
+        /// stat'ing inside the Photos library package. For videos it is exact:
+        /// `requestAVAsset` with network access disabled returns nil precisely
+        /// when the original isn't local. For images it is optimistic: Photos
+        /// serves cached derivatives for cloud-only originals, so a successful
+        /// thumbnail request can't distinguish the two, and `nil` here means
+        /// "not determined" — callers keep whatever value they already had.
+        let isLocal: Bool?
     }
 
     private static let thumbnailSize = CGSize(width: 128, height: 128)
     private static let videoFrameFractions = [0.0, 0.25, 0.5, 0.75]
+    /// `fetchAssets(withLocalIdentifiers:)` resolves every identifier through a
+    /// single synchronous round-trip to `photolibraryd`. Asking for a whole
+    /// several-hundred-thousand-asset library at once makes that one enormous
+    /// request; chunking keeps each round-trip small and interruptible.
+    private static let fetchChunkSize = 2_000
 
     private let assets: [String: PHAsset]
     private let imageManager = PHImageManager.default()
 
     init(uuidToIdentifier: [(uuid: String, localIdentifier: String)]) {
-        let fetch = PHAsset.fetchAssets(
-            withLocalIdentifiers: uuidToIdentifier.map(\.localIdentifier), options: nil)
         var byIdentifier: [String: PHAsset] = [:]
-        fetch.enumerateObjects { asset, _, _ in byIdentifier[asset.localIdentifier] = asset }
+        let identifiers = uuidToIdentifier.map(\.localIdentifier)
+        var start = 0
+        while start < identifiers.count {
+            let end = min(start + Self.fetchChunkSize, identifiers.count)
+            let fetch = PHAsset.fetchAssets(
+                withLocalIdentifiers: Array(identifiers[start..<end]), options: nil)
+            fetch.enumerateObjects { asset, _, _ in byIdentifier[asset.localIdentifier] = asset }
+            start = end
+        }
         var map: [String: PHAsset] = [:]
         for entry in uuidToIdentifier {
             if let asset = byIdentifier[entry.localIdentifier] { map[entry.uuid] = asset }
@@ -41,7 +62,7 @@ final class AssetHasher: @unchecked Sendable {
 
     func hash(uuid: String) async -> HashResult {
         guard let asset = assets[uuid] else {
-            return HashResult(uuid: uuid, primary: nil, variants: [])
+            return HashResult(uuid: uuid, primary: nil, variants: [], isLocal: nil)
         }
         if asset.mediaType == .video {
             return await hashVideo(uuid: uuid, asset: asset)
@@ -50,9 +71,9 @@ final class AssetHasher: @unchecked Sendable {
               let hashes = PHash.orientationHashes(cgImage: image),
               let primary = hashes.first
         else {
-            return HashResult(uuid: uuid, primary: nil, variants: [])
+            return HashResult(uuid: uuid, primary: nil, variants: [], isLocal: nil)
         }
-        return HashResult(uuid: uuid, primary: primary, variants: hashes)
+        return HashResult(uuid: uuid, primary: primary, variants: hashes, isLocal: nil)
     }
 
     // MARK: - Images
@@ -84,16 +105,16 @@ final class AssetHasher: @unchecked Sendable {
         if let avAsset = await requestLocalAVAsset(asset) {
             let frames = await Self.frameHashes(avAsset, duration: asset.duration)
             if let primary = frames.first {
-                return HashResult(uuid: uuid, primary: primary, variants: frames)
+                return HashResult(uuid: uuid, primary: primary, variants: frames, isLocal: true)
             }
         }
         // Cloud-only (or unreadable) videos: Photos' cached poster frame.
         guard let poster = await requestThumbnail(asset),
               let hash = PHash.hash(cgImage: poster)
         else {
-            return HashResult(uuid: uuid, primary: nil, variants: [])
+            return HashResult(uuid: uuid, primary: nil, variants: [], isLocal: false)
         }
-        return HashResult(uuid: uuid, primary: hash, variants: [hash])
+        return HashResult(uuid: uuid, primary: hash, variants: [hash], isLocal: false)
     }
 
     /// AVAsset isn't Sendable, so it crosses the callback boundary in an

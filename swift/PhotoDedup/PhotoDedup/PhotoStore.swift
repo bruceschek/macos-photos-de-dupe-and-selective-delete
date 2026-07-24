@@ -19,6 +19,9 @@ struct PhotoRow: Codable, FetchableRecord, PersistableRecord {
     var width: Int?
     var height: Int?
     var isLocal: Bool
+    /// Vestigial: always NULL. Held a guessed path inside the Photos library
+    /// package until every read path moved to PhotoKit. Kept so the struct
+    /// still mirrors the table, which retains the column.
     var filePath: String?
     var mediaType: String
     var duration: Double?
@@ -84,7 +87,15 @@ struct ScanStateRow: Codable, FetchableRecord, PersistableRecord {
 actor PhotoStore {
     static let shared = PhotoStore()
 
-    private let dbQueue: DatabaseQueue
+    // DatabasePool (not DatabaseQueue): WAL mode gives concurrent readers while
+    // a single writer holds the lock. Live clustering writes every ~4s and hash
+    // results flush every 200 rows during a scan — on a single-connection
+    // DatabaseQueue, a read issued while either of those writes is in flight
+    // (e.g. the user clicking into a cluster) blocks until it finishes. A pool
+    // lets the UI read the current state without waiting on the background
+    // writer, which is what makes "browse already-found groups while the scan
+    // keeps running" actually non-blocking rather than just non-crashing.
+    private let dbPool: DatabasePool
 
     private init() {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -95,7 +106,7 @@ actor PhotoStore {
         var config = Configuration()
         config.foreignKeysEnabled = true
 
-        dbQueue = try! DatabaseQueue(path: dbURL.path, configuration: config)
+        dbPool = try! DatabasePool(path: dbURL.path, configuration: config)
 
         var migrator = DatabaseMigrator()
         migrator.registerMigration("v1") { db in
@@ -155,14 +166,23 @@ actor PhotoStore {
             // photo (e.g. "Beach, Sky"). Populated during the clustering pass.
             try db.execute(sql: "ALTER TABLE clusters ADD COLUMN caption TEXT")
         }
-        try! migrator.migrate(dbQueue)
+        migrator.registerMigration("v4") { db in
+            // Study Blocks: long, time-continuous runs of similar photos flagged
+            // for human culling. These describe such a block and stay NULL for the
+            // duplicate kinds. `time_span_seconds` is the block's capture duration;
+            // `estimated_redundant` is how many members look near-identical to an
+            // earlier frame in the run (a cull-count estimate).
+            try db.execute(sql: "ALTER TABLE clusters ADD COLUMN time_span_seconds REAL")
+            try db.execute(sql: "ALTER TABLE clusters ADD COLUMN estimated_redundant INTEGER")
+        }
+        try! migrator.migrate(dbPool)
     }
 
     func write<T: Sendable>(_ block: @escaping @Sendable (Database) throws -> T) async throws -> T {
-        try await dbQueue.write(block)
+        try await dbPool.write(block)
     }
 
     func read<T: Sendable>(_ block: @escaping @Sendable (Database) throws -> T) async throws -> T {
-        try await dbQueue.read(block)
+        try await dbPool.read(block)
     }
 }

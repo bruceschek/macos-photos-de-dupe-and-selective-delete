@@ -44,9 +44,21 @@ actor LocalBackend {
     private var candidateCursor = 0
     private var candidateTotal = 0
     private var pendingHashWrites: [(uuid: String, primary: String, variants: String)] = []
+    /// uuid → locality, for the assets where hashing learned it definitively.
+    private var pendingLocalityWrites: [(uuid: String, isLocal: Bool)] = []
     private var pipelineFailure: Error?
 
     private static let writeBatchSize = 200
+
+    /// Ceiling on hash workers, and therefore on how many `PHImageManager`
+    /// requests are ever in flight against `photolibraryd` at once. Left
+    /// unbounded (one worker per core) this pass keeps every core's worth of
+    /// XPC requests pending against a single daemon for the whole scan — on a
+    /// large library that is sustained pressure on a process the whole system,
+    /// including Photos.app itself, depends on. Hashing is dominated by that
+    /// round-trip rather than by local CPU, so a modest cap costs little
+    /// throughput and leaves the daemon responsive to everyone else.
+    private static let maxHashWorkers = 6
     private let signposter = OSSignposter(
         subsystem: "com.bruceschechter.PhotoDedup", category: "Scan")
 
@@ -66,15 +78,19 @@ actor LocalBackend {
         let now = Date().timeIntervalSince1970
         try await store.write { db in
             for r in records {
+                // file_path is deliberately never written: it used to hold a
+                // guessed path inside the Photos library package, and every
+                // read path now goes through PhotoKit instead. The column
+                // stays for schema compatibility and is always NULL.
                 try db.execute(sql: """
                     INSERT OR REPLACE INTO photos
                       (uuid, local_identifier, filename, original_filename, date_taken, burst_uuid,
-                       is_raw, is_live, width, height, is_local, file_path,
+                       is_raw, is_live, width, height, is_local,
                        media_type, duration, scanned_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, arguments: StatementArguments([
                         r.uuid, r.localIdentifier, r.filename, r.originalFilename, r.dateTaken, r.burstUuid,
-                        r.isRaw, r.isLive, r.width, r.height, r.isLocal, r.filePath,
+                        r.isRaw, r.isLive, r.width, r.height, r.isLocal,
                         r.mediaType, r.duration, now,
                     ] as [(any DatabaseValueConvertible)?]))
             }
@@ -150,7 +166,7 @@ actor LocalBackend {
             state.state = "clustering"
             let clusterInterval = signposter.beginInterval("clustering")
             let clusterCount = try await store.write { db in
-                try Clusterer.buildClusters(db)
+                try Clusterer.buildClusters(db, includeStudyBlocks: true)
             }
             signposter.endInterval("clustering", clusterInterval)
 
@@ -216,12 +232,14 @@ actor LocalBackend {
         candidateCursor = 0
         candidateTotal = candidates.count
         pendingHashWrites = []
+        pendingLocalityWrites = []
         pipelineFailure = nil
 
         let hasher = AssetHasher(
             uuidToIdentifier: candidates.map { ($0.uuid, $0.localIdentifier) })
 
-        let workerCount = max(2, ProcessInfo.processInfo.activeProcessorCount)
+        let workerCount = min(
+            Self.maxHashWorkers, max(2, ProcessInfo.processInfo.activeProcessorCount))
         await withTaskGroup(of: Void.self) { group in
             for _ in 0..<workerCount {
                 group.addTask {
@@ -260,14 +278,18 @@ actor LocalBackend {
     private func record(_ result: AssetHasher.HashResult, generation: Int) async {
         guard pipelineGeneration == generation else { return }
         state.scanned += 1
+        if let isLocal = result.isLocal {
+            pendingLocalityWrites.append((result.uuid, isLocal))
+        }
         if let primary = result.primary {
             pendingHashWrites.append(
                 (result.uuid, primary, result.variants.joined(separator: ",")))
-            if pendingHashWrites.count >= Self.writeBatchSize {
-                await flushHashWrites()
-            }
         } else {
             state.skippedCloud += 1   // couldn't produce a hash for this asset
+        }
+        if pendingHashWrites.count >= Self.writeBatchSize
+            || pendingLocalityWrites.count >= Self.writeBatchSize {
+            await flushHashWrites()
         }
         if state.scanned % 500 == 0, let start = state.scanStartTime {
             let elapsed = Date().timeIntervalSince1970 - start
@@ -278,15 +300,22 @@ actor LocalBackend {
     }
 
     private func flushHashWrites() async {
-        guard !pendingHashWrites.isEmpty else { return }
+        guard !pendingHashWrites.isEmpty || !pendingLocalityWrites.isEmpty else { return }
         let batch = pendingHashWrites
+        let locality = pendingLocalityWrites
         pendingHashWrites = []
+        pendingLocalityWrites = []
         do {
             try await store.write { db in
                 for item in batch {
                     try db.execute(
                         sql: "UPDATE photos SET phash=?, phash_variants=? WHERE uuid=?",
                         arguments: [item.primary, item.variants, item.uuid])
+                }
+                for item in locality {
+                    try db.execute(
+                        sql: "UPDATE photos SET is_local=? WHERE uuid=?",
+                        arguments: [item.isLocal, item.uuid])
                 }
             }
         } catch {
@@ -432,6 +461,7 @@ actor LocalBackend {
         return try await store.read { db in
             var sql = """
                 SELECT c.id, c.kind, c.confidence, c.caption,
+                       c.time_span_seconds, c.estimated_redundant,
                        COUNT(cm.photo_uuid) as member_count,
                        MIN(cm.photo_uuid)   as representative_uuid,
                        MAX(p.date_taken)    as latest_date,
@@ -474,7 +504,9 @@ actor LocalBackend {
                     memberCount: row["member_count"],
                     representativeUuid: row["representative_uuid"],
                     representativeIdentifier: row["representative_identifier"],
-                    caption: row["caption"]
+                    caption: row["caption"],
+                    timeSpanSeconds: row["time_span_seconds"],
+                    estimatedRedundant: row["estimated_redundant"]
                 )
             }
         }
@@ -508,7 +540,6 @@ actor LocalBackend {
                     width: row.width,
                     height: row.height,
                     isLocal: row.isLocal,
-                    filePath: row.filePath,
                     phash: row.phash
                 )
             }

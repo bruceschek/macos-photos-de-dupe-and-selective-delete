@@ -12,8 +12,9 @@ struct PhotoMeta: Codable, Identifiable, Sendable {
     let isLive: Bool
     let width: Int?
     let height: Int?
+    /// Best-known guess at whether the original is on this Mac. Exact for
+    /// videos, optimistic for images — see `AssetHasher.HashResult.isLocal`.
     let isLocal: Bool
-    let filePath: String?
     let phash: String?
 
     enum CodingKeys: String, CodingKey {
@@ -26,7 +27,6 @@ struct PhotoMeta: Codable, Identifiable, Sendable {
         case isLive = "is_live"
         case width, height
         case isLocal = "is_local"
-        case filePath = "file_path"
         case phash
     }
 }
@@ -40,12 +40,16 @@ struct ClusterSummary: Codable, Identifiable, Hashable, Sendable {
     let representativeUuid: String
     let representativeIdentifier: String?   // PHAsset localIdentifier for the row thumbnail
     let caption: String?                    // Vision 2–3 word scene label, nil until captioned
+    let timeSpanSeconds: Double?            // study blocks only: capture duration of the run
+    let estimatedRedundant: Int?            // study blocks only: rough cull count
 
     enum CodingKeys: String, CodingKey {
         case id, kind, confidence, caption
         case memberCount = "member_count"
         case representativeUuid = "representative_uuid"
         case representativeIdentifier = "representative_identifier"
+        case timeSpanSeconds = "time_span_seconds"
+        case estimatedRedundant = "estimated_redundant"
     }
 }
 
